@@ -9,7 +9,7 @@ on:
         default: 'false'
         type: boolean
       benchmark:
-        description: 'Run CPU benchmark (sysbench)'
+        description: 'Run CPU benchmark'
         required: false
         default: 'false'
         type: boolean
@@ -28,7 +28,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq tree sysbench lscpu > /dev/null 2>&1 || true
+          sudo apt-get install -y -qq jq tree sysbench
 
       - name: System Overview
         run: |
@@ -167,17 +167,53 @@ jobs:
             fi
           done
 
-      - name: CPU Benchmark (Optional)
+      - name: CPU Benchmark
         if: ${{ inputs.benchmark == true }}
         run: |
           echo "=========================================="
           echo "      CPU BENCHMARK"
           echo "=========================================="
-          echo "--- sysbench CPU (single thread) ---"
-          sysbench cpu --cpu-max-prime=10000 --threads=1 run
-          echo ""
-          echo "--- sysbench CPU (all threads) ---"
-          sysbench cpu --cpu-max-prime=10000 --threads=$(nproc) run
+          if command -v sysbench &> /dev/null; then
+            echo "--- sysbench CPU (single thread) ---"
+            sysbench cpu --cpu-max-prime=10000 --threads=1 run
+            echo ""
+            echo "--- sysbench CPU (all threads) ---"
+            sysbench cpu --cpu-max-prime=10000 --threads=$(nproc) run
+          else
+            echo "sysbench not available, using Python fallback benchmark"
+            python3 -c "
+import time
+import math
+import multiprocessing
+
+def benchmark():
+    start = time.time()
+    count = 0
+    for i in range(2, 10000):
+        is_prime = True
+        for j in range(2, int(math.sqrt(i)) + 1):
+            if i % j == 0:
+                is_prime = False
+                break
+        if is_prime:
+            count += 1
+    return time.time() - start
+
+# Single thread
+t1 = benchmark()
+print(f'Single thread: {t1:.3f}s (found {count} primes)')
+
+# Multi thread
+threads = multiprocessing.cpu_count()
+pool = multiprocessing.Pool(threads)
+start = time.time()
+results = pool.map(lambda _: benchmark(), range(threads))
+pool.close()
+pool.join()
+multi_time = time.time() - start
+print(f'Multi thread ({threads} cores): {multi_time:.3f}s total')
+"
+          fi
 
       - name: GitHub Actions Context
         run: |
@@ -198,10 +234,8 @@ jobs:
 
       - name: Generate JSON Report
         run: |
-          # Block devices via lsblk (native JSON)
           BLOCK_JSON=$(lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,UUID 2>/dev/null || echo '{"blockdevices":[]}')
 
-          # Write Python script for compute info
           cat > /tmp/compute.py << 'PYEOF'
           import json, subprocess, re, os
 
@@ -277,7 +311,6 @@ jobs:
           PYEOF
           CPU_JSON=$(python3 /tmp/compute.py)
 
-          # Write Python script for disks
           cat > /tmp/disks.py << 'PYEOF'
           import json, subprocess
           result = subprocess.run(['df', '-T'], capture_output=True, text=True)
@@ -299,7 +332,6 @@ jobs:
           PYEOF
           DISKS_JSON=$(python3 /tmp/disks.py)
 
-          # Write Python script for inodes
           cat > /tmp/inodes.py << 'PYEOF'
           import json, subprocess
           result = subprocess.run(['df', '-i'], capture_output=True, text=True)
@@ -320,7 +352,6 @@ jobs:
           PYEOF
           INODES_JSON=$(python3 /tmp/inodes.py)
 
-          # Combine with jq
           jq -n \
             --arg hostname "$(hostname)" \
             --arg timestamp "$(date -Iseconds)" \
@@ -353,7 +384,6 @@ jobs:
               }
             }' > storage-report.json
 
-          # Validate and pretty-print
           jq . storage-report.json > storage-report-pretty.json
           mv storage-report-pretty.json storage-report.json
           echo "JSON generated successfully"
