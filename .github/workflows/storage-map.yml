@@ -200,130 +200,126 @@ jobs:
         run: |
           # Block devices via lsblk (native JSON)
           BLOCK_JSON=$(lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,UUID 2>/dev/null || echo '{"blockdevices":[]}')
-          
-          # CPU info via Python
-          CPU_JSON=$(python3 -c "
-import json, subprocess, re, os
 
-# lscpu
-lscpu = subprocess.run(['lscpu'], capture_output=True, text=True).stdout
-cpu_info = {}
-for line in lscpu.strip().split('\n'):
-    if ':' in line:
-        k, v = line.split(':', 1)
-        cpu_info[k.strip().lower().replace(' ', '_')] = v.strip()
+          # Write Python script for compute info
+          cat > /tmp/compute.py << 'PYEOF'
+          import json, subprocess, re, os
 
-# /proc/cpuinfo
-with open('/proc/cpuinfo') as f:
-    proc_cpu = f.read()
-model_name = re.search(r'model name\\s*:\\s*(.+)', proc_cpu)
-cpu_cores = re.search(r'cpu cores\\s*:\\s*(\\d+)', proc_cpu)
-siblings = re.search(r'siblings\\s*:\\s*(\\d+)', proc_cpu)
+          lscpu = subprocess.run(['lscpu'], capture_output=True, text=True).stdout
+          cpu_info = {}
+          for line in lscpu.strip().split('\n'):
+              if ':' in line:
+                  k, v = line.split(':', 1)
+                  cpu_info[k.strip().lower().replace(' ', '_')] = v.strip()
 
-# /proc/loadavg
-with open('/proc/loadavg') as f:
-    loadavg = f.read().strip().split()
+          with open('/proc/cpuinfo') as f:
+              proc_cpu = f.read()
+          model_name = re.search(r'model name\s*:\s*(.+)', proc_cpu)
+          cpu_cores = re.search(r'cpu cores\s*:\s*(\d+)', proc_cpu)
+          siblings = re.search(r'siblings\s*:\s*(\d+)', proc_cpu)
 
-# /proc/meminfo
-mem = {}
-with open('/proc/meminfo') as f:
-    for line in f:
-        if ':' in line:
-            k, v = line.split(':', 1)
-            mem[k.strip()] = v.strip().split()[0]
+          with open('/proc/loadavg') as f:
+              loadavg = f.read().strip().split()
 
-# vmstat
-vmstat = subprocess.run(['vmstat', '-s'], capture_output=True, text=True).stdout
+          mem = {}
+          with open('/proc/meminfo') as f:
+              for line in f:
+                  if ':' in line:
+                      k, v = line.split(':', 1)
+                      mem[k.strip()] = v.strip().split()[0]
 
-# nproc
-threads = os.cpu_count()
+          vmstat = subprocess.run(['vmstat', '-s'], capture_output=True, text=True).stdout
+          threads = os.cpu_count()
 
-result = {
-    'cpu': {
-        'model': model_name.group(1) if model_name else None,
-        'cores': int(cpu_cores.group(1)) if cpu_cores else None,
-        'threads': threads,
-        'siblings': int(siblings.group(1)) if siblings else None,
-        'architecture': cpu_info.get('architecture', None),
-        'byte_order': cpu_info.get('byte_order', None),
-        'cpu_family': cpu_info.get('cpu_family', None),
-        'model': cpu_info.get('model', None),
-        'stepping': cpu_info.get('stepping', None),
-        'cpu_mhz': cpu_info.get('cpu_mhz', None),
-        'bogomips': cpu_info.get('bogomips', None),
-        'virtualization': cpu_info.get('virtualization', None),
-        'hypervisor_vendor': cpu_info.get('hypervisor_vendor', None),
-        'virtualization_type': cpu_info.get('virtualization_type', None),
-        'caches': {
-            'l1d': cpu_info.get('l1d_cache', None),
-            'l1i': cpu_info.get('l1i_cache', None),
-            'l2': cpu_info.get('l2_cache', None),
-            'l3': cpu_info.get('l3_cache', None)
-        }
-    },
-    'load_average': {
-        '1min': float(loadavg[0]),
-        '5min': float(loadavg[1]),
-        '15min': float(loadavg[2]),
-        'running_tasks': loadavg[3].split('/')[0],
-        'total_tasks': loadavg[3].split('/')[1]
-    },
-    'memory': {
-        'total_kb': int(mem.get('MemTotal', 0)),
-        'free_kb': int(mem.get('MemFree', 0)),
-        'available_kb': int(mem.get('MemAvailable', 0)),
-        'buffers_kb': int(mem.get('Buffers', 0)),
-        'cached_kb': int(mem.get('Cached', 0)),
-        'swap_total_kb': int(mem.get('SwapTotal', 0)),
-        'swap_free_kb': int(mem.get('SwapFree', 0)),
-        'total_human': cpu_info.get('mem_total', None)
-    },
-    'vmstat': vmstat.strip()
-}
-print(json.dumps(result, indent=2))
-")
-          
-          # Disks via Python
-          DISKS_JSON=$(python3 -c "
-import json, subprocess
-result = subprocess.run(['df', '-T'], capture_output=True, text=True)
-lines = result.stdout.strip().split('\n')[1:]
-disks = []
-for line in lines:
-    parts = line.split()
-    if len(parts) >= 7:
-        disks.append({
-            'source': parts[0],
-            'fstype': parts[1],
-            'size': parts[2],
-            'used': parts[3],
-            'avail': parts[4],
-            'pcent': parts[5],
-            'mountpoint': ' '.join(parts[6:])
-        })
-print(json.dumps(disks))
-")
-          
-          # Inodes via Python
-          INODES_JSON=$(python3 -c "
-import json, subprocess
-result = subprocess.run(['df', '-i'], capture_output=True, text=True)
-lines = result.stdout.strip().split('\n')[1:]
-inodes = []
-for line in lines:
-    parts = line.split()
-    if len(parts) >= 6:
-        inodes.append({
-            'source': parts[0],
-            'itotal': parts[1],
-            'iused': parts[2],
-            'iavail': parts[3],
-            'ipcent': parts[4],
-            'mountpoint': ' '.join(parts[5:])
-        })
-print(json.dumps(inodes))
-")
-          
+          result = {
+              'cpu': {
+                  'model': model_name.group(1) if model_name else None,
+                  'cores': int(cpu_cores.group(1)) if cpu_cores else None,
+                  'threads': threads,
+                  'siblings': int(siblings.group(1)) if siblings else None,
+                  'architecture': cpu_info.get('architecture'),
+                  'byte_order': cpu_info.get('byte_order'),
+                  'cpu_family': cpu_info.get('cpu_family'),
+                  'model': cpu_info.get('model'),
+                  'stepping': cpu_info.get('stepping'),
+                  'cpu_mhz': cpu_info.get('cpu_mhz'),
+                  'bogomips': cpu_info.get('bogomips'),
+                  'virtualization': cpu_info.get('virtualization'),
+                  'hypervisor_vendor': cpu_info.get('hypervisor_vendor'),
+                  'virtualization_type': cpu_info.get('virtualization_type'),
+                  'caches': {
+                      'l1d': cpu_info.get('l1d_cache'),
+                      'l1i': cpu_info.get('l1i_cache'),
+                      'l2': cpu_info.get('l2_cache'),
+                      'l3': cpu_info.get('l3_cache')
+                  }
+              },
+              'load_average': {
+                  '1min': float(loadavg[0]),
+                  '5min': float(loadavg[1]),
+                  '15min': float(loadavg[2]),
+                  'running_tasks': loadavg[3].split('/')[0],
+                  'total_tasks': loadavg[3].split('/')[1]
+              },
+              'memory': {
+                  'total_kb': int(mem.get('MemTotal', 0)),
+                  'free_kb': int(mem.get('MemFree', 0)),
+                  'available_kb': int(mem.get('MemAvailable', 0)),
+                  'buffers_kb': int(mem.get('Buffers', 0)),
+                  'cached_kb': int(mem.get('Cached', 0)),
+                  'swap_total_kb': int(mem.get('SwapTotal', 0)),
+                  'swap_free_kb': int(mem.get('SwapFree', 0)),
+                  'total_human': cpu_info.get('mem_total')
+              },
+              'vmstat': vmstat.strip()
+          }
+          print(json.dumps(result))
+          PYEOF
+          CPU_JSON=$(python3 /tmp/compute.py)
+
+          # Write Python script for disks
+          cat > /tmp/disks.py << 'PYEOF'
+          import json, subprocess
+          result = subprocess.run(['df', '-T'], capture_output=True, text=True)
+          lines = result.stdout.strip().split('\n')[1:]
+          disks = []
+          for line in lines:
+              parts = line.split()
+              if len(parts) >= 7:
+                  disks.append({
+                      'source': parts[0],
+                      'fstype': parts[1],
+                      'size': parts[2],
+                      'used': parts[3],
+                      'avail': parts[4],
+                      'pcent': parts[5],
+                      'mountpoint': ' '.join(parts[6:])
+                  })
+          print(json.dumps(disks))
+          PYEOF
+          DISKS_JSON=$(python3 /tmp/disks.py)
+
+          # Write Python script for inodes
+          cat > /tmp/inodes.py << 'PYEOF'
+          import json, subprocess
+          result = subprocess.run(['df', '-i'], capture_output=True, text=True)
+          lines = result.stdout.strip().split('\n')[1:]
+          inodes = []
+          for line in lines:
+              parts = line.split()
+              if len(parts) >= 6:
+                  inodes.append({
+                      'source': parts[0],
+                      'itotal': parts[1],
+                      'iused': parts[2],
+                      'iavail': parts[3],
+                      'ipcent': parts[4],
+                      'mountpoint': ' '.join(parts[5:])
+                  })
+          print(json.dumps(inodes))
+          PYEOF
+          INODES_JSON=$(python3 /tmp/inodes.py)
+
           # Combine with jq
           jq -n \
             --arg hostname "$(hostname)" \
@@ -356,7 +352,7 @@ print(json.dumps(inodes))
                 tool_cache: $tool_cache
               }
             }' > storage-report.json
-          
+
           # Validate and pretty-print
           jq . storage-report.json > storage-report-pretty.json
           mv storage-report-pretty.json storage-report.json
