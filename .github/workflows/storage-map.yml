@@ -139,30 +139,49 @@ jobs:
 
       - name: Generate JSON Report
         run: |
-          HOSTNAME=$(hostname)
-          TIMESTAMP=$(date -Iseconds)
+          # Use lsblk for disk info (reliable JSON output)
+          BLOCK_JSON=$(lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,UUID 2>/dev/null || echo '{"blockdevices":[]}')
           
-          # Build disks JSON
-          DISKS_JSON=$(df -T -x tmpfs -x devtmpfs --output=source,fstype,size,used,avail,pcent,target | tail -n +2 | \
-            awk 'BEGIN{print "["} {
-              printf "%s{\"source\":\"%s\",\"fstype\":\"%s\",\"size\":\"%s\",\"used\":\"%s\",\"avail\":\"%s\",\"pcent\":\"%s\",\"mountpoint\":\"%s\"}",
-              (NR==1?"":","), $1, $2, $3, $4, $5, $6, $7
-            } END{print "]"}')
+          # Use df with explicit --output and parse with jq -R
+          DISKS_JSON=$(df --output=source,fstype,size,used,avail,pcent,target | tail -n +2 | \
+            jq -R -s '
+              split("\n") | map(select(length > 0)) |
+              map(split(" ") | map(select(length > 0))) |
+              map({
+                source: .[0],
+                fstype: .[1],
+                size: .[2],
+                used: .[3],
+                avail: .[4],
+                pcent: .[5],
+                mountpoint: .[6:]
+                  | join(" ")
+                  | ltrimstr(" ")
+                  | rtrimstr(" ")
+              })
+            ')
           
-          # Build inodes JSON
-          INODES_JSON=$(df -i -x tmpfs -x devtmpfs --output=source,itotal,iused,iavail,ipcent,target | tail -n +2 | \
-            awk 'BEGIN{print "["} {
-              printf "%s{\"source\":\"%s\",\"itotal\":\"%s\",\"iused\":\"%s\",\"iavail\":\"%s\",\"ipcent\":\"%s\",\"mountpoint\":\"%s\"}",
-              (NR==1?"":","), $1, $2, $3, $4, $5, $6
-            } END{print "]"}')
+          INODES_JSON=$(df -i --output=source,itotal,iused,iavail,ipcent,target | tail -n +2 | \
+            jq -R -s '
+              split("\n") | map(select(length > 0)) |
+              map(split(" ") | map(select(length > 0))) |
+              map({
+                source: .[0],
+                itotal: .[1],
+                iused: .[2],
+                iavail: .[3],
+                ipcent: .[4],
+                mountpoint: .[5:]
+                  | join(" ")
+                  | ltrimstr(" ")
+                  | rtrimstr(" ")
+              })
+            ')
           
-          # Build block devices JSON
-          BLOCK_JSON=$(lsblk -J -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL 2>/dev/null || echo '[]')
-          
-          # Combine with jq
+          # Combine everything
           jq -n \
-            --arg hostname "$HOSTNAME" \
-            --arg timestamp "$TIMESTAMP" \
+            --arg hostname "$(hostname)" \
+            --arg timestamp "$(date -Iseconds)" \
             --arg runner_os "${RUNNER_OS}" \
             --arg runner_arch "${RUNNER_ARCH}" \
             --arg runner_name "${RUNNER_NAME}" \
@@ -190,8 +209,10 @@ jobs:
               }
             }' > storage-report.json
           
-          # Validate
-          jq empty storage-report.json && echo "JSON valid" || echo "JSON invalid"
+          # Validate and pretty-print
+          jq . storage-report.json > storage-report-pretty.json
+          mv storage-report-pretty.json storage-report.json
+          echo "JSON generated successfully"
 
       - name: Upload Report
         uses: actions/upload-artifact@v4
