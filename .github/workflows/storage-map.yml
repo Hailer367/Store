@@ -9,21 +9,21 @@ on:
         default: 'false'
         type: boolean
   schedule:
-    - cron: '0 0 * * 0'  # Weekly on Sunday
+    - cron: '0 0 * * 0'
 
 jobs:
   map-storage:
-    runs-on: ubuntu-latest  # Change to self-hosted for your own server
+    runs-on: ubuntu-latest
     name: Full Storage Audit
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install mapping tools
+      - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq tree ncdu jq > /dev/null 2>&1 || true
+          sudo apt-get install -y -qq jq tree > /dev/null 2>&1 || true
 
       - name: System Overview
         run: |
@@ -32,7 +32,7 @@ jobs:
           echo "=========================================="
           echo "Hostname:     $(hostname)"
           echo "Date:         $(date -Iseconds)"
-          echo "OS:           $(lsb_release -d -s 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+          echo "OS:           $(lsb_release -d -s 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
           echo "Kernel:       $(uname -r)"
           echo "Architecture: $(uname -m)"
           echo ""
@@ -42,64 +42,45 @@ jobs:
           echo "=========================================="
           echo "      BLOCK DEVICES"
           echo "=========================================="
-          echo "--- lsblk (all) ---"
           lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,ROTA,UUID || lsblk
           echo ""
           echo "--- Physical Disks ---"
           lsblk -d -o NAME,SIZE,ROTA,TYPE,MODEL,SERIAL || true
-          echo ""
-          echo "--- Block Device Details ---"
-          for dev in $(lsblk -nd -o NAME 2>/dev/null); do
-            echo ">> /dev/$dev:"
-            blockdev --getbsz /dev/$dev 2>/dev/null && blockdev --getsize64 /dev/$dev 2>/dev/null | awk '{print "  size_bytes:", $1}' || true
-          done
 
       - name: Filesystems & Mounts
         run: |
           echo "=========================================="
           echo "      FILESYSTEMS & MOUNTS"
           echo "=========================================="
-          echo "--- /proc/filesystems ---"
           cat /proc/filesystems
           echo ""
-          echo "--- Mount Points (sorted) ---"
+          echo "--- Mount Points ---"
           mount | sort | column -t
           echo ""
-          echo "--- /etc/fstab ---"
-          cat /etc/fstab 2>/dev/null || echo "No fstab found"
-          echo ""
-          echo "--- /proc/mounts ---"
-          cat /proc/mounts | column -t
+          cat /etc/fstab 2>/dev/null || echo "No fstab"
 
-      - name: Disk Usage (All Partitions)
+      - name: Disk Usage
         run: |
           echo "=========================================="
-          echo "      DISK USAGE (Human Readable)"
+          echo "      DISK USAGE"
           echo "=========================================="
           df -hT | column -t
-          echo ""
-          echo "=========================================="
-          echo "      DISK USAGE (Exact Bytes)"
-          echo "=========================================="
-          df -T | column -t
           echo ""
           echo "=========================================="
           echo "      INODE USAGE"
           echo "=========================================="
           df -hiT | column -t
 
-      - name: Logical Volume Manager (LVM)
+      - name: LVM Status
         run: |
           echo "=========================================="
           echo "      LVM STATUS"
           echo "=========================================="
-          sudo pvs 2>/dev/null || echo "No physical volumes found"
+          sudo pvs 2>/dev/null || echo "No PVs"
           echo ""
-          sudo vgs 2>/dev/null || echo "No volume groups found"
+          sudo vgs 2>/dev/null || echo "No VGs"
           echo ""
-          sudo lvs 2>/dev/null || echo "No logical volumes found"
-          echo ""
-          sudo lvdisplay 2>/dev/null || true
+          sudo lvs 2>/dev/null || echo "No LVs"
 
       - name: RAM & Swap
         run: |
@@ -108,36 +89,29 @@ jobs:
           echo "=========================================="
           free -h
           echo ""
-          echo "--- Swap Details ---"
           swapon --show 2>/dev/null || true
-          cat /proc/swaps 2>/dev/null || true
 
-      - name: Special Mounts (tmpfs, devtmpfs, cgroup, etc.)
+      - name: Virtual Filesystems
         run: |
           echo "=========================================="
           echo "      VIRTUAL / TEMP FILESYSTEMS"
           echo "=========================================="
-          df -hT | grep -E '(tmpfs|devtmpfs|cgroup|overlay|squashfs)' | column -t
-          echo ""
-          echo "--- tmpfs detail ---"
-          mount | grep tmpfs | sort
+          df -hT | grep -E '(tmpfs|devtmpfs|cgroup|overlay|squashfs)' | column -t || true
 
-      - name: Directory Size Map (Top 30)
+      - name: Top 30 Largest Directories
         run: |
           echo "=========================================="
           echo "      TOP 30 LARGEST DIRECTORIES"
           echo "=========================================="
-          # Scan from root but suppress errors
           sudo du -h / 2>/dev/null | sort -rh | head -30 || \
           du -h /home /usr /var /opt 2>/dev/null | sort -rh | head -30
 
-      - name: Deep Directory Scan (Optional)
+      - name: Deep Directory Scan
         if: ${{ inputs.deep_scan == true }}
         run: |
           echo "=========================================="
           echo "      DEEP DIRECTORY ANALYSIS"
           echo "=========================================="
-          # Per-directory breakdowns
           for dir in / /home /usr /var /opt /tmp; do
             if [ -d "$dir" ]; then
               echo ""
@@ -159,71 +133,71 @@ jobs:
           echo "RUNNER_WORKSPACE:    ${RUNNER_WORKSPACE}"
           echo "GITHUB_WORKSPACE:    ${GITHUB_WORKSPACE}"
           echo ""
-          echo "--- Workspace Disk Usage ---"
           du -sh "${GITHUB_WORKSPACE}" 2>/dev/null || true
-          echo "--- Tool Cache Disk Usage ---"
           du -sh "${RUNNER_TOOL_CACHE}" 2>/dev/null || true
-          echo "--- Temp Disk Usage ---"
           du -sh "${RUNNER_TEMP}" 2>/dev/null || true
 
       - name: Generate JSON Report
         run: |
-          cat > storage-map.json << 'EOF'
-          {
-            "meta": {
-              "hostname": "$(hostname)",
-              "timestamp": "$(date -Iseconds)",
-              "runner": "${RUNNER_NAME}",
-              "os": "${RUNNER_OS}",
-              "arch": "${RUNNER_ARCH}"
-            },
-            "disks": $(df -T -x tmpfs -x devtmpfs --output=source,fstype,size,used,avail,pcent,target | jq -R -s '
-              split("\n") | map(select(length > 0)) | .[1:] |
-              map(split(" ") | map(select(length > 0))) |
-              map({
-                source: .[0],
-                fstype: .[1],
-                size: .[2],
-                used: .[3],
-                avail: .[4],
-                pcent: .[5],
-                mountpoint: .[6]
-              })
-            '),
-            "inodes": $(df -i -x tmpfs -x devtmpfs --output=source,itotal,iused,iavail,ipcent,target | jq -R -s '
-              split("\n") | map(select(length > 0)) | .[1:] |
-              map(split(" ") | map(select(length > 0))) |
-              map({
-                source: .[0],
-                itotal: .[1],
-                iused: .[2],
-                iavail: .[3],
-                ipcent: .[4],
-                mountpoint: .[5]
-              })
-            '),
-            "block_devices": $(lsblk -J -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL 2>/dev/null || echo '[]'),
-            "env": {
-              "workspace": "${GITHUB_WORKSPACE}",
-              "temp": "${RUNNER_TEMP}",
-              "tool_cache": "${RUNNER_TOOL_CACHE}"
-            }
-          }
-          EOF
-          # Replace shell command substitutions with actual values
-          eval "echo \"$(cat storage-map.json)\"" > storage-report.json 2>/dev/null || true
-          if command -v jq &> /dev/null && [ -f storage-report.json ]; then
-            jq . storage-report.json > storage-report-pretty.json
-            mv storage-report-pretty.json storage-report.json
-          fi
+          HOSTNAME=$(hostname)
+          TIMESTAMP=$(date -Iseconds)
+          
+          # Build disks JSON
+          DISKS_JSON=$(df -T -x tmpfs -x devtmpfs --output=source,fstype,size,used,avail,pcent,target | tail -n +2 | \
+            awk 'BEGIN{print "["} {
+              printf "%s{\"source\":\"%s\",\"fstype\":\"%s\",\"size\":\"%s\",\"used\":\"%s\",\"avail\":\"%s\",\"pcent\":\"%s\",\"mountpoint\":\"%s\"}",
+              (NR==1?"":","), $1, $2, $3, $4, $5, $6, $7
+            } END{print "]"}')
+          
+          # Build inodes JSON
+          INODES_JSON=$(df -i -x tmpfs -x devtmpfs --output=source,itotal,iused,iavail,ipcent,target | tail -n +2 | \
+            awk 'BEGIN{print "["} {
+              printf "%s{\"source\":\"%s\",\"itotal\":\"%s\",\"iused\":\"%s\",\"iavail\":\"%s\",\"ipcent\":\"%s\",\"mountpoint\":\"%s\"}",
+              (NR==1?"":","), $1, $2, $3, $4, $5, $6
+            } END{print "]"}')
+          
+          # Build block devices JSON
+          BLOCK_JSON=$(lsblk -J -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL 2>/dev/null || echo '[]')
+          
+          # Combine with jq
+          jq -n \
+            --arg hostname "$HOSTNAME" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg runner_os "${RUNNER_OS}" \
+            --arg runner_arch "${RUNNER_ARCH}" \
+            --arg runner_name "${RUNNER_NAME}" \
+            --arg workspace "${GITHUB_WORKSPACE}" \
+            --arg temp "${RUNNER_TEMP}" \
+            --arg tool_cache "${RUNNER_TOOL_CACHE}" \
+            --argjson disks "$DISKS_JSON" \
+            --argjson inodes "$INODES_JSON" \
+            --argjson block_devices "$BLOCK_JSON" \
+            '{
+              meta: {
+                hostname: $hostname,
+                timestamp: $timestamp,
+                runner: $runner_name,
+                os: $runner_os,
+                arch: $runner_arch
+              },
+              disks: $disks,
+              inodes: $inodes,
+              block_devices: $block_devices,
+              env: {
+                workspace: $workspace,
+                temp: $temp,
+                tool_cache: $tool_cache
+              }
+            }' > storage-report.json
+          
+          # Validate
+          jq empty storage-report.json && echo "JSON valid" || echo "JSON invalid"
 
-      - name: Upload Storage Report
+      - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
           name: storage-map-report-${{ github.run_id }}
-          path: |
-            storage-report.json
-            storage-map.json
+          path: storage-report.json
           retention-days: 30
 
       - name: Summary
@@ -231,7 +205,6 @@ jobs:
           echo "=========================================="
           echo "      SUMMARY"
           echo "=========================================="
-          echo "Total disk usage:"
           df -h --total | tail -1 | column -t
           echo ""
           echo "Report saved as artifact: storage-map-report-${{ github.run_id }}"
