@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       deep_scan:
-        description: 'Run deep directory scan (slower)'
+        description: 'Run deep directory scan'
         required: false
         default: 'false'
         type: boolean
@@ -48,41 +48,25 @@ jobs:
           echo "=========================================="
           echo "      CPU INFORMATION"
           echo "=========================================="
-          echo "--- lscpu ---"
           lscpu
           echo ""
-          echo "--- /proc/cpuinfo (summary) ---"
           grep -m1 'model name' /proc/cpuinfo
           grep -m1 'cpu cores' /proc/cpuinfo
           grep -m1 'siblings' /proc/cpuinfo
-          grep -m1 'cache size' /proc/cpuinfo
-          echo ""
-          echo "--- CPU Counts ---"
-          echo "Physical CPUs:  $(lscpu -p | grep -v '^#' | sort -u -t, -k1,1 | wc -l)"
-          echo "Cores per CPU:  $(lscpu | grep 'Core(s) per socket' | awk -F: '{print $2}' | xargs)"
           echo "Total Threads:  $(nproc)"
           echo ""
           echo "--- Load Average ---"
           cat /proc/loadavg
-          echo ""
-          echo "--- CPU Scaling Governors ---"
-          cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c || echo "No cpufreq info"
 
       - name: Memory & Swap Detail
         run: |
           echo "=========================================="
           echo "      MEMORY DETAIL"
           echo "=========================================="
-          echo "--- /proc/meminfo ---"
           cat /proc/meminfo | head -20
           echo ""
-          echo "--- free -h ---"
           free -h
           echo ""
-          echo "--- vmstat ---"
-          vmstat -s | head -10
-          echo ""
-          echo "--- Swap ---"
           swapon --show 2>/dev/null || true
           cat /proc/swaps 2>/dev/null || true
 
@@ -93,7 +77,6 @@ jobs:
           echo "=========================================="
           lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,ROTA,UUID || lsblk
           echo ""
-          echo "--- Physical Disks ---"
           lsblk -d -o NAME,SIZE,ROTA,TYPE,MODEL,SERIAL || true
 
       - name: Filesystems & Mounts
@@ -103,7 +86,6 @@ jobs:
           echo "=========================================="
           cat /proc/filesystems
           echo ""
-          echo "--- Mount Points ---"
           mount | sort | column -t
           echo ""
           cat /etc/fstab 2>/dev/null || echo "No fstab"
@@ -112,11 +94,6 @@ jobs:
         run: |
           echo "=========================================="
           echo "      DISK USAGE"
-          echo "=========================================="
-          df -T | column -t
-          echo ""
-          echo "=========================================="
-          echo "      DISK USAGE (Human Readable)"
           echo "=========================================="
           df -hT | column -t
 
@@ -133,9 +110,7 @@ jobs:
           echo "      LVM STATUS"
           echo "=========================================="
           sudo pvs 2>/dev/null || echo "No PVs"
-          echo ""
           sudo vgs 2>/dev/null || echo "No VGs"
-          echo ""
           sudo lvs 2>/dev/null || echo "No LVs"
 
       - name: Virtual Filesystems
@@ -174,69 +149,21 @@ jobs:
           echo "      CPU BENCHMARK"
           echo "=========================================="
           if command -v sysbench &> /dev/null; then
-            echo "--- sysbench CPU (single thread) ---"
+            echo "--- sysbench single thread ---"
             sysbench cpu --cpu-max-prime=10000 --threads=1 run
             echo ""
-            echo "--- sysbench CPU (all threads) ---"
+            echo "--- sysbench multi thread ---"
             sysbench cpu --cpu-max-prime=10000 --threads=$(nproc) run
           else
-            echo "sysbench not available, using Python fallback benchmark"
-            python3 -c "
-import time
-import math
-import multiprocessing
-
-def benchmark():
-    start = time.time()
-    count = 0
-    for i in range(2, 10000):
-        is_prime = True
-        for j in range(2, int(math.sqrt(i)) + 1):
-            if i % j == 0:
-                is_prime = False
-                break
-        if is_prime:
-            count += 1
-    return time.time() - start
-
-# Single thread
-t1 = benchmark()
-print(f'Single thread: {t1:.3f}s (found {count} primes)')
-
-# Multi thread
-threads = multiprocessing.cpu_count()
-pool = multiprocessing.Pool(threads)
-start = time.time()
-results = pool.map(lambda _: benchmark(), range(threads))
-pool.close()
-pool.join()
-multi_time = time.time() - start
-print(f'Multi thread ({threads} cores): {multi_time:.3f}s total')
-"
+            echo "sysbench not available, using Python fallback"
+            python3 /tmp/benchmark.py
           fi
 
-      - name: GitHub Actions Context
+      - name: Write Python Scripts
         run: |
-          echo "=========================================="
-          echo "      GITHUB ACTIONS ENVIRONMENT"
-          echo "=========================================="
-          echo "RUNNER_OS:           ${RUNNER_OS}"
-          echo "RUNNER_ARCH:         ${RUNNER_ARCH}"
-          echo "RUNNER_NAME:         ${RUNNER_NAME}"
-          echo "RUNNER_TOOL_CACHE:   ${RUNNER_TOOL_CACHE}"
-          echo "RUNNER_TEMP:         ${RUNNER_TEMP}"
-          echo "RUNNER_WORKSPACE:    ${RUNNER_WORKSPACE}"
-          echo "GITHUB_WORKSPACE:    ${GITHUB_WORKSPACE}"
-          echo ""
-          du -sh "${GITHUB_WORKSPACE}" 2>/dev/null || true
-          du -sh "${RUNNER_TOOL_CACHE}" 2>/dev/null || true
-          du -sh "${RUNNER_TEMP}" 2>/dev/null || true
+          mkdir -p /tmp/scripts
 
-      - name: Generate JSON Report
-        run: |
-          BLOCK_JSON=$(lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,UUID 2>/dev/null || echo '{"blockdevices":[]}')
-
-          cat > /tmp/compute.py << 'PYEOF'
+          cat > /tmp/scripts/compute.py << 'PYEOF'
           import json, subprocess, re, os
 
           lscpu = subprocess.run(['lscpu'], capture_output=True, text=True).stdout
@@ -309,9 +236,8 @@ print(f'Multi thread ({threads} cores): {multi_time:.3f}s total')
           }
           print(json.dumps(result))
           PYEOF
-          CPU_JSON=$(python3 /tmp/compute.py)
 
-          cat > /tmp/disks.py << 'PYEOF'
+          cat > /tmp/scripts/disks.py << 'PYEOF'
           import json, subprocess
           result = subprocess.run(['df', '-T'], capture_output=True, text=True)
           lines = result.stdout.strip().split('\n')[1:]
@@ -330,9 +256,8 @@ print(f'Multi thread ({threads} cores): {multi_time:.3f}s total')
                   })
           print(json.dumps(disks))
           PYEOF
-          DISKS_JSON=$(python3 /tmp/disks.py)
 
-          cat > /tmp/inodes.py << 'PYEOF'
+          cat > /tmp/scripts/inodes.py << 'PYEOF'
           import json, subprocess
           result = subprocess.run(['df', '-i'], capture_output=True, text=True)
           lines = result.stdout.strip().split('\n')[1:]
@@ -350,7 +275,59 @@ print(f'Multi thread ({threads} cores): {multi_time:.3f}s total')
                   })
           print(json.dumps(inodes))
           PYEOF
-          INODES_JSON=$(python3 /tmp/inodes.py)
+
+          cat > /tmp/benchmark.py << 'PYEOF'
+          import time, math, multiprocessing
+
+          def benchmark():
+              start = time.time()
+              count = 0
+              for i in range(2, 10000):
+                  is_prime = True
+                  for j in range(2, int(math.sqrt(i)) + 1):
+                      if i % j == 0:
+                          is_prime = False
+                          break
+                  if is_prime:
+                      count += 1
+              return time.time() - start
+
+          t1 = benchmark()
+          print("Single thread: {:.3f}s".format(t1))
+
+          threads = multiprocessing.cpu_count()
+          pool = multiprocessing.Pool(threads)
+          start = time.time()
+          pool.map(lambda _: benchmark(), range(threads))
+          pool.close()
+          pool.join()
+          multi_time = time.time() - start
+          print("Multi thread ({} cores): {:.3f}s total".format(threads, multi_time))
+          PYEOF
+
+      - name: GitHub Actions Context
+        run: |
+          echo "=========================================="
+          echo "      GITHUB ACTIONS ENVIRONMENT"
+          echo "=========================================="
+          echo "RUNNER_OS:           ${RUNNER_OS}"
+          echo "RUNNER_ARCH:         ${RUNNER_ARCH}"
+          echo "RUNNER_NAME:         ${RUNNER_NAME}"
+          echo "RUNNER_TOOL_CACHE:   ${RUNNER_TOOL_CACHE}"
+          echo "RUNNER_TEMP:         ${RUNNER_TEMP}"
+          echo "RUNNER_WORKSPACE:    ${RUNNER_WORKSPACE}"
+          echo "GITHUB_WORKSPACE:    ${GITHUB_WORKSPACE}"
+          echo ""
+          du -sh "${GITHUB_WORKSPACE}" 2>/dev/null || true
+          du -sh "${RUNNER_TOOL_CACHE}" 2>/dev/null || true
+          du -sh "${RUNNER_TEMP}" 2>/dev/null || true
+
+      - name: Generate JSON Report
+        run: |
+          BLOCK_JSON=$(lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,UUID 2>/dev/null || echo '{"blockdevices":[]}')
+          CPU_JSON=$(python3 /tmp/scripts/compute.py)
+          DISKS_JSON=$(python3 /tmp/scripts/disks.py)
+          INODES_JSON=$(python3 /tmp/scripts/inodes.py)
 
           jq -n \
             --arg hostname "$(hostname)" \
