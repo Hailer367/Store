@@ -1,0 +1,841 @@
+name: LLaMA Main Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker1_ip:
+        description: 'Worker 1 Tailscale IP (required)'
+        required: true
+        type: string
+      worker2_ip:
+        description: 'Worker 2 Tailscale IP (required)'
+        required: true
+        type: string
+      worker3_ip:
+        description: 'Worker 3 Tailscale IP (required)'
+        required: true
+        type: string
+      worker4_ip:
+        description: 'Worker 4 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker5_ip:
+        description: 'Worker 5 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker6_ip:
+        description: 'Worker 6 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker7_ip:
+        description: 'Worker 7 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker8_ip:
+        description: 'Worker 8 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker9_ip:
+        description: 'Worker 9 Tailscale IP (optional)'
+        required: false
+        type: string
+      worker10_ip:
+        description: 'Worker 10 Tailscale IP (optional)'
+        required: false
+        type: string
+      duration_minutes:
+        description: 'How long to keep the server alive (minutes)'
+        required: true
+        default: '300'
+      n_gpu_layers:
+        description: 'Layers to offload to RPC workers (99 = all, 0 = none/main only)'
+        required: false
+        default: '99'
+      tensor_split:
+        description: 'Optional comma list of weights, e.g. "1,1,1" for equal split (leave blank for auto)'
+        required: false
+        default: ''
+      model_choice:
+        description: 'Model to serve (sets repo + file automatically)'
+        required: true
+        default: 'Qwen3-Coder 30B A3B'
+        type: choice
+        options:
+          - 'Qwen3-Coder 30B A3B'
+          - 'Qwen3.6 27B'
+          - 'Gemma 4 E4B'
+          - 'Devstral Small 2 (24B)'
+          - 'FLUX.2 Klein 4B  WARNING IMAGE MODEL - not supported by llama-server'
+      run_distribution_test:
+        description: 'Run a test inference to verify all workers receive traffic'
+        required: false
+        default: 'true'
+
+jobs:
+  main-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      RPC_PORT: '50052'
+      SERVER_PORT: '8080'
+      API_KEY: 'sk-local-llama'
+      MODEL_DIR: '/home/runner/models'
+      # MODEL_REPO and MODEL_FILE are set dynamically by the
+      # "Resolve model configuration" step based on model_choice input.
+
+    steps:
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            wget \
+            jq \
+            python3 \
+            python3-pip \
+            iproute2 \
+            netcat-openbsd \
+            bc \
+            ca-certificates
+
+      - name: Build llama.cpp with RPC support
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+          cd llama.cpp
+          cmake -S . -B build -G Ninja -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Verify binaries exist
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd llama.cpp
+          ls -la build/bin/
+          # The main server only needs llama-server; the RPC server binary lives on
+          # the worker nodes and its name varies across llama.cpp builds.
+          if [ ! -x "./build/bin/llama-server" ]; then
+            echo "Could not find llama-server binary"
+            exit 1
+          fi
+          echo "LLAMA_BIN=$(pwd)/build/bin" >> "$GITHUB_ENV"
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale network
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo tailscale up \
+            --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="llama-main-${{ github.run_id }}" \
+            --accept-routes \
+            --reset \
+            --timeout=30s
+
+          for _ in {1..30}; do
+            MAIN_IP="$(tailscale ip -4 2>/dev/null || true)"
+            if [ -n "$MAIN_IP" ]; then
+              echo "MAIN_IP=$MAIN_IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Tailscale IPv4 was not assigned in time"
+          exit 1
+
+      - name: Resolve model configuration
+        shell: bash
+        env:
+          MODEL_CHOICE: ${{ inputs.model_choice }}
+        run: |
+          set -euo pipefail
+
+          # ---------------------------------------------------------------
+          # Map the dropdown selection to a HuggingFace repo + GGUF file.
+          # All three text models are Unsloth Dynamic 2.0 Q4_K_XL quants —
+          # the best balance of quality and size for CPU-RPC inference.
+          #
+          # FLUX.2 Klein 4B is a text-to-image DIFFUSION model (Black Forest
+          # Labs). It is served by stable-diffusion.cpp / ComfyUI-GGUF, NOT
+          # by llama-server. Selecting it intentionally hard-fails here so
+          # the error is obvious rather than a cryptic load failure later.
+          # ---------------------------------------------------------------
+
+          case "$MODEL_CHOICE" in
+            'Qwen3-Coder 30B A3B')
+              REPO='unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'
+              FILE='Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf'
+              ;;
+            'Qwen3.6 27B')
+              REPO='unsloth/Qwen3.6-27B-GGUF'
+              FILE='Qwen3.6-27B-UD-Q4_K_XL.gguf'
+              ;;
+            'Gemma 4 E4B')
+              REPO='unsloth/gemma-4-E4B-it-GGUF'
+              FILE='gemma-4-E4B-it-UD-Q4_K_XL.gguf'
+              ;;
+            'Devstral Small 2 (24B)')
+              REPO='unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF'
+              FILE='Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf'
+              ;;
+            'FLUX.2 Klein 4B  WARNING IMAGE MODEL - not supported by llama-server')
+              echo ""
+              echo "=========================================================="
+              echo "  ERROR: FLUX.2 Klein 4B is a text-to-IMAGE diffusion"
+              echo "  model (Black Forest Labs). It cannot be loaded by"
+              echo "  llama-server. Use stable-diffusion.cpp or ComfyUI"
+              echo "  with the ComfyUI-GGUF node instead."
+              echo ""
+              echo "  HuggingFace repo: unsloth/FLUX.2-klein-4B-GGUF"
+              echo "  ComfyUI-GGUF:     https://github.com/city96/ComfyUI-GGUF"
+              echo "=========================================================="
+              echo ""
+              exit 1
+              ;;
+            *)
+              echo "Unknown model_choice: '$MODEL_CHOICE'"
+              exit 1
+              ;;
+          esac
+
+          echo "MODEL_REPO=$REPO" >> "$GITHUB_ENV"
+          echo "MODEL_FILE=$FILE"  >> "$GITHUB_ENV"
+
+          echo ""
+          echo "Model selected : $MODEL_CHOICE"
+          echo "HuggingFace repo: $REPO"
+          echo "GGUF file       : $FILE"
+          echo ""
+
+      - name: Collect and validate active workers
+        shell: bash
+        env:
+          WORKER1_IP: ${{ inputs.worker1_ip }}
+          WORKER2_IP: ${{ inputs.worker2_ip }}
+          WORKER3_IP: ${{ inputs.worker3_ip }}
+          WORKER4_IP: ${{ inputs.worker4_ip }}
+          WORKER5_IP: ${{ inputs.worker5_ip }}
+          WORKER6_IP: ${{ inputs.worker6_ip }}
+          WORKER7_IP: ${{ inputs.worker7_ip }}
+          WORKER8_IP: ${{ inputs.worker8_ip }}
+          WORKER9_IP: ${{ inputs.worker9_ip }}
+          WORKER10_IP: ${{ inputs.worker10_ip }}
+        run: |
+          set -euo pipefail
+          ACTIVE_WORKERS=()
+          SEEN='|'
+
+          for idx in $(seq 1 10); do
+            var="WORKER${idx}_IP"
+            ip="${!var:-}"
+            if [ -z "$ip" ]; then
+              continue
+            fi
+            if [[ "$SEEN" == *"|$ip|"* ]]; then
+              echo "Duplicate worker IP detected: $ip"
+              exit 1
+            fi
+            ACTIVE_WORKERS+=("$ip")
+            SEEN="${SEEN}${ip}|"
+          done
+
+          if [ "${#ACTIVE_WORKERS[@]}" -lt 3 ]; then
+            echo "This workflow requires at least 3 worker IPs."
+            exit 1
+          fi
+
+          ACTIVE_ENDPOINTS=()
+          for ip in "${ACTIVE_WORKERS[@]}"; do
+            ACTIVE_ENDPOINTS+=("${ip}:${RPC_PORT}")
+          done
+
+          ACTIVE_WORKER_IPS_JOINED="$(IFS=,; echo "${ACTIVE_WORKERS[*]}")"
+          ACTIVE_WORKER_ENDPOINTS_JOINED="$(IFS=,; echo "${ACTIVE_ENDPOINTS[*]}")"
+
+          {
+            echo "ACTIVE_WORKER_COUNT=${#ACTIVE_WORKERS[@]}"
+            echo "ACTIVE_WORKER_IPS=$ACTIVE_WORKER_IPS_JOINED"
+            echo "ACTIVE_WORKER_ENDPOINTS=$ACTIVE_WORKER_ENDPOINTS_JOINED"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify workers are reachable on RPC port
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+
+          check_worker() {
+            local ip="$1"
+            echo "Checking ${ip}:${RPC_PORT} ..."
+            for i in {1..60}; do
+              if nc -z -w 3 "${ip}" "${RPC_PORT}" 2>/dev/null; then
+                echo "  ${ip}:${RPC_PORT} is reachable"
+                return 0
+              fi
+              echo "  Attempt $i/60 failed, retrying in 5s..."
+              sleep 5
+            done
+            echo "Timed out waiting for ${ip}:${RPC_PORT}"
+            return 1
+          }
+
+          for ip in "${WORKERS[@]}"; do
+            check_worker "$ip"
+          done
+
+      - name: Snapshot pre-load TCP state on each worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+          mkdir -p /tmp/dist-check
+
+          # Record reachability + a connect-only probe before model load.
+          # We mark each worker as "reachable" if a TCP handshake succeeds.
+          for ip in "${WORKERS[@]}"; do
+            if nc -z -w 3 "${ip}" "${RPC_PORT}" 2>/dev/null; then
+              echo "ok" > "/tmp/dist-check/pre_${ip}.txt"
+            else
+              echo "fail" > "/tmp/dist-check/pre_${ip}.txt"
+            fi
+          done
+          echo "Pre-load snapshot complete."
+
+      - name: Install hf CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pip install --break-system-packages "huggingface_hub[hf_xet]"
+          echo "HF_XET_HIGH_PERFORMANCE=1" >> "$GITHUB_ENV"
+
+      - name: Download model from HuggingFace
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MODEL_DIR"
+
+          echo "Downloading $MODEL_FILE from $MODEL_REPO ..."
+          hf download "$MODEL_REPO" "$MODEL_FILE" \
+            --local-dir "$MODEL_DIR" \
+            --token "$HF_TOKEN"
+
+          MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
+
+          if [ ! -f "$MODEL_PATH" ]; then
+            echo "Model file not found at $MODEL_PATH after download"
+            ls -la "$MODEL_DIR/"
+            exit 1
+          fi
+
+          echo "Model downloaded: $(du -sh "$MODEL_PATH" | cut -f1)"
+          echo "MODEL_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
+
+      - name: Build llama-server command line
+        shell: bash
+        env:
+          INPUT_NGL: ${{ inputs.n_gpu_layers }}
+          INPUT_TENSOR_SPLIT: ${{ inputs.tensor_split }}
+        run: |
+          set -euo pipefail
+
+          NGL_VALUE="${INPUT_NGL:-99}"
+          if ! [[ "$NGL_VALUE" =~ ^[0-9]+$ ]]; then
+            echo "n_gpu_layers must be a non-negative integer, got: $NGL_VALUE"
+            exit 1
+          fi
+
+          TS_ARGS=()
+          if [ -n "${INPUT_TENSOR_SPLIT:-}" ]; then
+            # Validate format: digits and dots separated by commas, e.g. "1,1,2" or "0.5,0.5"
+            if ! [[ "$INPUT_TENSOR_SPLIT" =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]]; then
+              echo "tensor_split must be comma-separated numbers, got: $INPUT_TENSOR_SPLIT"
+              exit 1
+            fi
+            TS_COUNT="$(awk -F, '{print NF}' <<< "$INPUT_TENSOR_SPLIT")"
+            if [ "$TS_COUNT" -ne "$ACTIVE_WORKER_COUNT" ]; then
+              echo "tensor_split has $TS_COUNT entries but there are $ACTIVE_WORKER_COUNT workers."
+              exit 1
+            fi
+            TS_ARGS=(--tensor-split "$INPUT_TENSOR_SPLIT")
+          fi
+
+          # Persist as env for the next step
+          echo "NGL_VALUE=$NGL_VALUE" >> "$GITHUB_ENV"
+          # Save tensor-split args (possibly empty) into a file so we don't have to
+          # smuggle an array through GITHUB_ENV.
+          printf '%s\n' "${TS_ARGS[@]}" > /tmp/ts_args.txt
+
+          echo "n_gpu_layers = $NGL_VALUE"
+          echo "tensor_split = ${INPUT_TENSOR_SPLIT:-<auto>}"
+
+          if [ "$NGL_VALUE" = "0" ]; then
+            echo ""
+            echo "WARNING: n_gpu_layers=0 means NO layers will be offloaded to RPC workers."
+            echo "         The workers will be connected but idle. Set n_gpu_layers to 99"
+            echo "         (or the model's layer count) to actually distribute the model."
+            echo ""
+          fi
+
+      - name: Start llama-server with RPC workers
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Starting llama-server..."
+          echo "  Model:        $MODEL_PATH"
+          echo "  RPC nodes:    $ACTIVE_WORKER_ENDPOINTS"
+          echo "  Port:         $SERVER_PORT"
+          echo "  n_gpu_layers: $NGL_VALUE"
+
+          # Reconstruct tensor-split args from file (one arg per line, possibly empty file)
+          TS_ARGS=()
+          if [ -s /tmp/ts_args.txt ]; then
+            while IFS= read -r line; do
+              [ -n "$line" ] && TS_ARGS+=("$line")
+            done < /tmp/ts_args.txt
+          fi
+
+          # NOTE: -v (verbose) is REQUIRED here. Without it, llama.cpp suppresses
+          # the per-RPC `load_tensors: RPC0[host:port] model buffer size = ...`
+          # INFO lines that the next step parses to confirm distribution. With
+          # default verbosity the log is ~9 lines long and the verifier sees no
+          # RPC traffic even though distribution is actually working.
+          nohup "$LLAMA_BIN/llama-server" \
+            -m "$MODEL_PATH" \
+            --rpc "$ACTIVE_WORKER_ENDPOINTS" \
+            -c 50000 \
+            -np 1 \
+            --host 0.0.0.0 \
+            --port "$SERVER_PORT" \
+            --api-key "$API_KEY" \
+            --jinja \
+            --no-webui \
+            -ngl "$NGL_VALUE" \
+            -v \
+            "${TS_ARGS[@]}" \
+            > /tmp/llama-server.log 2>&1 &
+
+          SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
+          echo "llama-server PID: $SERVER_PID"
+
+          echo "Waiting for server to become ready (up to 10 minutes)..."
+          READY=0
+          for i in {1..120}; do
+            if curl -sf \
+                -H "Authorization: Bearer $API_KEY" \
+                "http://localhost:$SERVER_PORT/v1/models" \
+                > /dev/null 2>&1; then
+              echo "Server is ready after $i attempts"
+              READY=1
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "llama-server exited unexpectedly:"
+              tail -n 200 /tmp/llama-server.log || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "Server never became ready. Last log:"
+            tail -n 200 /tmp/llama-server.log || true
+            exit 1
+          fi
+
+      - name: Verify workload distribution from llama-server log
+        shell: bash
+        run: |
+          # IMPORTANT: GitHub Actions wraps this script with `bash -e -o pipefail`
+          # at invocation time (see the `shell:` line in the rendered run output).
+          # We deliberately turn BOTH of those off here, because this step contains
+          # several `grep ... | grep ... | awk ...` pipelines whose first grep is
+          # ALLOWED to return 1 (= no match yet). Under the default `-e -o pipefail`,
+          # the very first iteration of the per-worker loop would silently kill the
+          # whole step and you'd see the table header but no rows -- exactly the
+          # failure mode this fix addresses.
+          set +e
+          set +o pipefail
+          set -u
+
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+          LOG=/tmp/llama-server.log
+
+          # llama-server's stdout is line-buffered through nohup, but the readiness
+          # probe in the previous step returns as soon as /v1/models answers, which
+          # on some llama.cpp builds is BEFORE all `load_tensors:` lines have been
+          # flushed to disk. Give the log a short grace period to settle so we
+          # don't run the parser against a half-written file.
+          # NOTE on the regex:
+          # llama.cpp tags per-RPC log lines with the device label, which has
+          # the form `RPC<index>[<host>:<port>]` (e.g. `RPC0[10.0.0.5:50052]`),
+          # not `RPC[<host>:<port>]`. Older versions of this workflow used
+          # `RPC\[` which never matched, so the verifier always reported
+          # "zero workers received tensors" even when distribution was fine.
+          # We accept any device index suffix: `RPC` followed by zero-or-more
+          # alphanumeric/underscore chars (handles `RPC0`, `RPC10`, and the
+          # rare label-less `RPC[` form some old builds emit).
+          mkdir -p /tmp/dist-check
+          for i in $(seq 1 24); do
+            if grep -qE "RPC[A-Za-z0-9_]*\[[^]]+\].*buffer size|load_tensors:.*offloaded" "$LOG" 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "================================================================"
+          echo "                 WORKLOAD DISTRIBUTION REPORT"
+          echo "================================================================"
+          echo ""
+
+          # 1. Show how llama.cpp discovered the RPC devices.
+          # The verbose log contains a `common_param: device_info:` block that
+          # lists each backend (CPU, RPC0, RPC1, ...) and also tagged lines
+          # like `RPC0[host:port]` once tensors are placed.
+          echo "[1/4] RPC devices registered by llama-server:"
+          grep -E "register_device|device_info:|^[0-9.]+ I cmn  common_param:[[:space:]]+- (CPU|RPC)|RPC[A-Za-z0-9_]*\[" "$LOG" 2>/dev/null | head -n 50
+          echo ""
+
+          # 2. Extract per-RPC buffer-size lines. llama.cpp prints lines like:
+          #    load_tensors:   RPC0[10.0.0.5:50052] model buffer size =  1234.56 MiB
+          # (The device prefix is `RPC<idx>`, not bare `RPC` -- accept both.)
+          echo "[2/4] Per-worker model buffer allocations:"
+          BUFFER_LINES="$(grep -E "RPC[A-Za-z0-9_]*\[[^]]+\].*buffer size" "$LOG" 2>/dev/null)"
+          if [ -n "$BUFFER_LINES" ]; then
+            echo "$BUFFER_LINES"
+          else
+            echo "  (No per-RPC buffer-size lines found yet.)"
+          fi
+          echo ""
+
+          # 3. Build a distribution table per worker.
+          echo "[3/4] Distribution summary table:"
+          printf "  %-20s %-12s %-18s %s\n" "WORKER_IP" "REACHABLE" "BUFFER_MIB" "STATUS"
+          printf "  %-20s %-12s %-18s %s\n" "--------------------" "------------" "------------------" "------------------------------"
+
+          TOTAL_MIB=0
+          ACTIVE_RECEIVERS=0
+          REPORT_FILE=/tmp/dist-check/report.txt
+          : > "$REPORT_FILE"
+
+          for ip in "${WORKERS[@]}"; do
+            # Use established-socket check rather than nc -z: once llama-server
+            # holds the persistent RPC session the worker's listen backlog is
+            # saturated and fresh TCP connects time out even though the worker is
+            # actively serving.
+            live_socks="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                          | tail -n +2 | wc -l | tr -d ' ')"
+            if [ "${live_socks:-0}" -gt 0 ]; then
+              REACHABLE="yes"
+            else
+              REACHABLE="no"
+            fi
+
+            # Sum all buffer-size MiB attributed to this worker (there may be multiple
+            # lines: model buffer, compute buffer, KV cache, etc.). Each stage in the
+            # pipeline is allowed to return 1 (no match) without aborting the step.
+            # Match `RPC<idx>[<ip>:<port>]` -- the optional index suffix is
+            # what current llama.cpp builds emit (RPC0, RPC1, ...).
+            MATCHED_LINES="$(grep -E "RPC[A-Za-z0-9_]*\[${ip}:${RPC_PORT}\].*buffer size" "$LOG" 2>/dev/null)"
+            if [ -n "$MATCHED_LINES" ]; then
+              MIB="$(printf '%s\n' "$MATCHED_LINES" \
+                      | grep -oE '[0-9]+\.[0-9]+ MiB' \
+                      | awk '{s+=$1} END {if (NR>0) printf "%.2f", s; else print "0.00"}')"
+            else
+              MIB="0.00"
+            fi
+
+            if awk -v m="$MIB" 'BEGIN{exit !(m+0 > 0)}'; then
+              STATUS="receiving workload"
+              ACTIVE_RECEIVERS=$((ACTIVE_RECEIVERS + 1))
+              TOTAL_MIB="$(awk -v a="$TOTAL_MIB" -v b="$MIB" 'BEGIN{printf "%.2f", a+b}')"
+            else
+              if [ "$NGL_VALUE" = "0" ]; then
+                STATUS="idle (-ngl 0 set)"
+              else
+                STATUS="connected but no tensors"
+              fi
+            fi
+
+            printf "  %-20s %-12s %-18s %s\n" "$ip" "$REACHABLE" "$MIB" "$STATUS"
+            echo "${ip} ${REACHABLE} ${MIB} ${STATUS}" >> "$REPORT_FILE"
+          done
+          echo ""
+          echo "  Total bytes distributed to workers: ${TOTAL_MIB} MiB"
+          echo "  Workers actively holding tensors:   ${ACTIVE_RECEIVERS} / ${ACTIVE_WORKER_COUNT}"
+          echo ""
+
+          # 4. Show the offload summary line
+          echo "[4/4] Layer offload summary:"
+          grep -E "offloaded|offload to|llm_load_tensors|load_tensors:|llama_prepare_model_devices:|using device RPC" "$LOG" 2>/dev/null \
+            | grep -Ei "offload|RPC|CPU|using device" | head -n 30
+          echo ""
+
+          echo "================================================================"
+
+          # Persist results for the next step / summary
+          {
+            echo "TOTAL_DISTRIBUTED_MIB=$TOTAL_MIB"
+            echo "ACTIVE_RECEIVERS=$ACTIVE_RECEIVERS"
+          } >> "$GITHUB_ENV"
+
+          # Hard fail if user expected distribution but none happened.
+          if [ "$NGL_VALUE" != "0" ] && [ "$ACTIVE_RECEIVERS" -eq 0 ]; then
+            echo ""
+            echo "ERROR: n_gpu_layers=$NGL_VALUE but zero workers received tensors."
+            echo "       This usually means one of:"
+            echo "         * llama.cpp could not reach the RPC workers during load"
+            echo "           (check for 'failed to connect' or 'rpc_send_data' errors below)."
+            echo "         * The model fits entirely on the main runner and llama.cpp"
+            echo "           did not need to offload to RPC (rare for 30B Q4)."
+            echo "         * The llama.cpp build is too new/old and the buffer-size log"
+            echo "           format changed; inspect the raw log below."
+            echo ""
+            echo "--- last 200 lines of /tmp/llama-server.log ---"
+            tail -n 200 "$LOG" 2>/dev/null
+            echo "--- end of log ---"
+            exit 1
+          fi
+
+      - name: Run distribution test inference
+        if: ${{ inputs.run_distribution_test == 'true' }}
+        shell: bash
+        run: |
+          # Same rationale as the previous step: this block runs `ss | tail | wc`
+          # pipelines whose first command is allowed to return non-zero
+          # (no matching sockets yet), so we drop `-e` and `pipefail` locally.
+          set +e
+          set +o pipefail
+          set -u
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+
+          echo ""
+          echo "================================================================"
+          echo "                  LIVE INFERENCE TRAFFIC TEST"
+          echo "================================================================"
+          echo ""
+          echo "Sampling each worker's TCP-established connection count from the"
+          echo "main runner's perspective, then sending a real completion request."
+          echo ""
+
+          before_counts=()
+          for ip in "${WORKERS[@]}"; do
+            # Count ESTABLISHED TCP sockets between this runner and that worker:port.
+            c="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                 | tail -n +2 | wc -l | tr -d ' ')"
+            before_counts+=("$c")
+            echo "  before  ${ip}:${RPC_PORT}  established=$c"
+          done
+
+          echo ""
+          echo "Sending test prompt to llama-server..."
+          REQ_BODY='{
+            "model": "'"$MODEL_FILE"'",
+            "messages": [
+              {"role": "user", "content": "Reply with the single word: ok"}
+            ],
+            "max_tokens": 8,
+            "temperature": 0
+          }'
+
+          RESP="$(curl -sS --max-time 180 \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$REQ_BODY" \
+            "http://localhost:$SERVER_PORT/v1/chat/completions" || true)"
+
+          echo "Response preview:"
+          echo "$RESP" | head -c 2000
+          echo ""
+          echo ""
+
+          if ! echo "$RESP" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
+            echo "Inference test FAILED - no valid response from server."
+            echo "Last server log:"
+            tail -n 100 /tmp/llama-server.log || true
+            exit 1
+          fi
+
+          echo "Inference test PASSED."
+          echo ""
+
+          # Check after-counts: workers that actually served traffic should show
+          # a live ESTABLISHED socket from this runner.
+          echo "Connection counts AFTER inference:"
+          active=0
+          for i in "${!WORKERS[@]}"; do
+            ip="${WORKERS[$i]}"
+            c="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                 | tail -n +2 | wc -l | tr -d ' ')"
+            echo "  after   ${ip}:${RPC_PORT}  established=$c"
+            if [ "$c" -gt 0 ]; then
+              active=$((active + 1))
+            fi
+          done
+
+          echo ""
+          echo "Workers with live RPC sockets during inference: $active / ${#WORKERS[@]}"
+          if [ "$NGL_VALUE" != "0" ] && [ "$active" -eq 0 ]; then
+            echo "WARNING: No live RPC sockets observed. Distribution may not be active."
+          fi
+          echo "================================================================"
+
+      - name: Write distribution report to job summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          {
+            echo "## LLaMA Distributed Inference Report"
+            echo ""
+            echo "- **Model:** \`$MODEL_FILE\`"
+            echo "- **Main Tailscale IP:** \`${MAIN_IP:-unknown}\`"
+            echo "- **Base URL:** \`http://${MAIN_IP:-unknown}:$SERVER_PORT/v1\`"
+            echo "- **Active workers:** ${ACTIVE_WORKER_COUNT:-?}"
+            echo "- **n_gpu_layers:** ${NGL_VALUE:-?}"
+            echo "- **Workers receiving tensors:** ${ACTIVE_RECEIVERS:-?} / ${ACTIVE_WORKER_COUNT:-?}"
+            echo "- **Total distributed buffer size:** ${TOTAL_DISTRIBUTED_MIB:-0} MiB"
+            echo ""
+            echo "### Per-worker distribution"
+            echo ""
+            echo "| Worker IP | Reachable | Buffer (MiB) | Status |"
+            echo "| --- | --- | --- | --- |"
+            if [ -f /tmp/dist-check/report.txt ]; then
+              while read -r ip reach mib status; do
+                echo "| \`$ip\` | $reach | $mib | $status |"
+              done < /tmp/dist-check/report.txt
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Display connection info
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========================================"
+          echo "  LLAMA SERVER IS LIVE"
+          echo ""
+          echo "  Model:         $MODEL_FILE"
+          echo "  Workers:       $ACTIVE_WORKER_COUNT nodes"
+          echo "  Endpoints:     $ACTIVE_WORKER_ENDPOINTS"
+          echo "  Distribution:  ${ACTIVE_RECEIVERS:-0}/$ACTIVE_WORKER_COUNT workers holding tensors"
+          echo ""
+          echo "  Tailscale IP:  $MAIN_IP"
+          echo "  Base URL:      http://$MAIN_IP:$SERVER_PORT/v1"
+          echo "  API Key:       $API_KEY"
+          echo ""
+          echo "  Cline settings:"
+          echo "    Provider:    OpenAI Compatible"
+          echo "    Base URL:    http://$MAIN_IP:$SERVER_PORT/v1"
+          echo "    API Key:     $API_KEY"
+          echo "    Model ID:    $MODEL_FILE"
+          echo ""
+          echo "  Health check:"
+          echo "    curl -H \"Authorization: Bearer $API_KEY\" \\"
+          echo "         http://$MAIN_IP:$SERVER_PORT/v1/models"
+          echo "========================================"
+          echo ""
+
+      - name: Keep server alive and monitor distribution health
+        shell: bash
+        run: |
+          set -uo pipefail
+          DURATION="${{ github.event.inputs.duration_minutes }}"
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+            echo "Invalid duration_minutes: $DURATION"
+            exit 1
+          fi
+
+          IFS=',' read -r -a WORKERS <<< "$ACTIVE_WORKER_IPS"
+
+          echo "Server will run for up to ${DURATION} minutes."
+          echo "Cancel this workflow run to shut it down early."
+          echo ""
+
+          END_TIME=$((SECONDS + DURATION * 60))
+          TICK=0
+
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
+            sleep 30
+            TICK=$((TICK + 1))
+
+            # 1. Make sure llama-server is still running.
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "llama-server stopped unexpectedly. Last log:"
+              tail -n 60 /tmp/llama-server.log || true
+              exit 1
+            fi
+
+            # 2. Every 5 minutes (10 ticks), probe each worker.
+            # NOTE: ggml-rpc-server accepts exactly one persistent connection from
+            # llama-server.  After that handshake the server stops accepting new TCP
+            # connects, so a fresh `nc -z` probe will always fail (connection refused
+            # or timeout) even while the worker is actively serving.  Instead, we
+            # check for an established socket from this runner to each worker — that
+            # is what actually indicates the worker is alive and connected.
+            if [ $((TICK % 10)) -eq 0 ]; then
+              unreachable=0
+              for ip in "${WORKERS[@]}"; do
+                live_socks="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                              | tail -n +2 | wc -l | tr -d ' ')"
+                if [ "${live_socks:-0}" -eq 0 ]; then
+                  echo "[ $(date -u '+%H:%M:%S') ] WARNING: worker ${ip}:${RPC_PORT} has no established RPC socket"
+                  unreachable=$((unreachable + 1))
+                fi
+              done
+              if [ "$unreachable" -gt 0 ]; then
+                echo "[ $(date -u '+%H:%M:%S') ] ${unreachable}/${#WORKERS[@]} workers lost RPC connection"
+              fi
+            fi
+
+            # 3. Full heartbeat every 10 minutes (20 ticks).
+            if [ $((TICK % 20)) -eq 0 ]; then
+              REMAINING=$(( (END_TIME - SECONDS) / 60 ))
+              echo "[ $(date -u '+%H:%M:%S') ] Server healthy. ~${REMAINING}m remaining."
+              echo "  Base URL: http://$MAIN_IP:$SERVER_PORT/v1"
+              echo "  API Key:  $API_KEY"
+
+              live=0
+              for ip in "${WORKERS[@]}"; do
+                c="$(ss -tn state established "( dst ${ip}:${RPC_PORT} )" 2>/dev/null \
+                     | tail -n +2 | wc -l | tr -d ' ')"
+                if [ "$c" -gt 0 ]; then
+                  live=$((live + 1))
+                fi
+              done
+              echo "  Workers with live RPC sockets: ${live}/${#WORKERS[@]}"
+            fi
+          done
+
+          echo "Duration reached. Shutting down gracefully."
+
+      - name: Cleanup on exit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "Shutting down..."
+          if [ -n "${SERVER_PID:-}" ]; then
+            kill "$SERVER_PID" 2>/dev/null || true
+          fi
+          pkill -f 'llama-server' || true
+          sudo tailscale down || true
