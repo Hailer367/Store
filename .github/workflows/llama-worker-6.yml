@@ -1,0 +1,154 @@
+name: LLaMA Worker 6
+
+on:
+  workflow_dispatch:
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      WORKER_ID: "6"
+      RPC_PORT: "50052"
+      KEEPALIVE_SECONDS: "21540"
+      LLAMA_CACHE: /tmp/llama-rpc-cache
+
+    steps:
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            iproute2 \
+            netcat-openbsd \
+            ca-certificates
+
+      - name: Build llama.cpp with RPC support
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+          cd llama.cpp
+          cmake -S . -B build -G Ninja -DGGML_RPC=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Detect RPC binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd llama.cpp
+          ls -la build/bin/
+          if [ -x ./build/bin/ggml-rpc-server ]; then
+            echo "RPC_BIN=./build/bin/ggml-rpc-server" >> "$GITHUB_ENV"
+          elif [ -x ./build/bin/rpc-server ]; then
+            echo "RPC_BIN=./build/bin/rpc-server" >> "$GITHUB_ENV"
+          elif [ -x ./build/bin/llama-rpc-server ]; then
+            echo "RPC_BIN=./build/bin/llama-rpc-server" >> "$GITHUB_ENV"
+          else
+            echo "Could not find an RPC server binary in build/bin"
+            exit 1
+          fi
+          mkdir -p "$LLAMA_CACHE"
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale network
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo tailscale up \
+            --authkey "${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="llama-worker6-${{ github.run_id }}" \
+            --accept-routes \
+            --reset \
+            --timeout=30s
+
+          for i in {1..30}; do
+            WORKER_IP="$(tailscale ip -4 2>/dev/null || true)"
+            if [ -n "$WORKER_IP" ]; then
+              echo "WORKER_IP=$WORKER_IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Tailscale IPv4 was not assigned in time"
+          exit 1
+
+      - name: Display worker details
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========================================"
+          echo "  WORKER $WORKER_ID IS READY"
+          echo "  Tailscale IP: $WORKER_IP"
+          echo "  RPC Port: $RPC_PORT"
+          echo "========================================"
+          echo ""
+
+      - name: Start RPC server and verify port
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd llama.cpp
+          echo "Starting RPC server on 0.0.0.0:${RPC_PORT} ..."
+          nohup "$RPC_BIN" -H 0.0.0.0 -p "$RPC_PORT" > /tmp/llama-rpc.log 2>&1 &
+          RPC_PID=$!
+          echo "RPC_PID=$RPC_PID"
+
+          for i in {1..30}; do
+            if ss -ltn | grep -q ":$RPC_PORT "; then
+              echo "RPC server is listening on port $RPC_PORT"
+              break
+            fi
+            if ! kill -0 "$RPC_PID" 2>/dev/null; then
+              echo "RPC server exited early"
+              cat /tmp/llama-rpc.log || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if ! ss -ltn | grep -q ":$RPC_PORT "; then
+            echo "RPC server never opened port $RPC_PORT"
+            cat /tmp/llama-rpc.log || true
+            exit 1
+          fi
+
+          echo ""
+          echo "Last RPC log lines:"
+          tail -n 20 /tmp/llama-rpc.log || true
+          echo ""
+          echo "RPC server running. Keeping worker alive for roughly 6 hours..."
+
+          END_TIME=$((SECONDS + KEEPALIVE_SECONDS))
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
+            if ! kill -0 "$RPC_PID" 2>/dev/null; then
+              echo "RPC server stopped unexpectedly"
+              cat /tmp/llama-rpc.log || true
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Cleanup on exit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "Shutting down worker..."
+          pkill -f 'ggml-rpc-server|rpc-server|llama-rpc-server' || true
+          sudo tailscale down || true
