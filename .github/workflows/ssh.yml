@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euxo pipefail
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH }}" \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
             --hostname="github-runner-${{ github.run_id }}" \
             --accept-routes \
             --reset \
