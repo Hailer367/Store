@@ -25,12 +25,10 @@ jobs:
 
       - name: Connect to Tailscale network
         shell: bash
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH }}
         run: |
           set -euxo pipefail
           sudo tailscale up \
-            --authkey="${TS_AUTHKEY}" \
+            --authkey="${{ secrets.TAILSCALE_AUTH }}" \
             --hostname="github-runner-${{ github.run_id }}" \
             --accept-routes \
             --reset \
