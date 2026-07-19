@@ -1,0 +1,86 @@
+name: Tailscale Runner Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'How long to keep the runner alive (minutes)'
+        required: true
+        default: '60'
+
+jobs:
+  tailscale-runner:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH }}
+        run: |
+          # Start tailscaled
+          sudo tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1055 &
+          sleep 2
+
+          # Bring up tailscale with the auth key
+          sudo -E tailscale up \
+            --authkey=${TS_AUTHKEY} \
+            --hostname=github-runner-${GITHUB_RUN_ID} \
+            --accept-routes \
+            --ssh
+
+          # Wait for connection
+          sleep 3
+
+          # Verify connection
+          echo "Tailscale status:"
+          tailscale status
+
+          # Print connection info
+          TAILSCALE_IP=$(tailscale ip -4)
+          echo ""
+          echo "=========================================="
+          echo "Runner is now on your tailnet!"
+          echo "=========================================="
+          echo "Tailscale IP: ${TAILSCALE_IP}"
+          echo "Hostname:     github-runner-${GITHUB_RUN_ID}"
+          echo ""
+          echo "SSH into the runner:"
+          echo "  tailscale ssh runner@${TAILSCALE_IP}"
+          echo ""
+          echo "Or use the hostname:"
+          echo "  tailscale ssh runner@github-runner-${GITHUB_RUN_ID}"
+          echo ""
+          echo "Note: The 'runner' user password is empty."
+          echo "      Use key auth or sudo without password."
+          echo "=========================================="
+
+      - name: Setup SSH server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+          # Enable passwordless sudo for runner user
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
+          sudo chmod 440 /etc/sudoers.d/runner-nopasswd
+
+          # Start SSH
+          sudo service ssh start
+
+          echo "SSH server is available on port 22 via Tailscale IP"
+
+      - name: Keep runner alive
+        run: |
+          DURATION=${{ github.event.inputs.duration_minutes }}
+          echo "Keeping runner alive for ${DURATION} minutes..."
+          echo "Cancel this workflow to terminate the runner early."
+          
+          for ((i=0; i<DURATION*60; i++)); do
+            sleep 1
+          done
