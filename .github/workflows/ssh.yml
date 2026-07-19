@@ -16,34 +16,45 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Tailscale
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-      - name: Connect to Tailscale
+      - name: Install and start isolated Tailscale
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH }}
         run: |
-          # Start tailscaled
-          sudo tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --outbound-http-proxy-listen=localhost:1055 &
-          sleep 2
+          # Install Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-          # Bring up tailscale with the auth key
-          sudo -E tailscale up \
+          # Create isolated directories for this runner
+          mkdir -p /tmp/tailscale-runner/state
+          mkdir -p /tmp/tailscale-runner/run
+
+          # Stop any existing tailscaled
+          sudo pkill tailscaled || true
+
+          # Start tailscaled with isolated state and socket
+          sudo tailscaled \
+            --statedir=/tmp/tailscale-runner/state \
+            --socket=/tmp/tailscale-runner/run/tailscaled.sock \
+            --tun=userspace-networking \
+            > /tmp/tailscale-runner/tailscaled.log 2>&1 &
+          
+          sleep 3
+
+          # Bring up tailscale using the isolated socket
+          sudo -E tailscale \
+            --socket=/tmp/tailscale-runner/run/tailscaled.sock \
+            up \
             --authkey=${TS_AUTHKEY} \
             --hostname=github-runner-${GITHUB_RUN_ID} \
             --accept-routes \
             --ssh
 
-          # Wait for connection
+          # Wait and verify
           sleep 3
-
-          # Verify connection
           echo "Tailscale status:"
-          tailscale status
+          sudo tailscale --socket=/tmp/tailscale-runner/run/tailscaled.sock status
 
           # Print connection info
-          TAILSCALE_IP=$(tailscale ip -4)
+          TAILSCALE_IP=$(sudo tailscale --socket=/tmp/tailscale-runner/run/tailscaled.sock ip -4)
           echo ""
           echo "=========================================="
           echo "Runner is now on your tailnet!"
@@ -56,9 +67,6 @@ jobs:
           echo ""
           echo "Or use the hostname:"
           echo "  tailscale ssh runner@github-runner-${GITHUB_RUN_ID}"
-          echo ""
-          echo "Note: The 'runner' user password is empty."
-          echo "      Use key auth or sudo without password."
           echo "=========================================="
 
       - name: Setup SSH server
@@ -72,8 +80,6 @@ jobs:
 
           # Start SSH
           sudo service ssh start
-
-          echo "SSH server is available on port 22 via Tailscale IP"
 
       - name: Keep runner alive
         run: |
