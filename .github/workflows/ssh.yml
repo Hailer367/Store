@@ -20,28 +20,39 @@ jobs:
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH }}
         run: |
-          # Install Tailscale
+          # Install Tailscale (this auto-starts system tailscaled)
           curl -fsSL https://tailscale.com/install.sh | sh
 
-          # Create isolated directories for this runner
-          mkdir -p /tmp/tailscale-runner/state
-          mkdir -p /tmp/tailscale-runner/run
-
-          # Stop any existing tailscaled
+          # Stop the system tailscaled that install.sh started
+          sudo systemctl stop tailscaled || true
           sudo pkill tailscaled || true
+          sleep 2
 
-          # Start tailscaled with isolated state and socket
+          # Create isolated directories for this runner instance
+          RUNNER_DIR="/tmp/tailscale-runner-${GITHUB_RUN_ID}"
+          mkdir -p ${RUNNER_DIR}/state
+          mkdir -p ${RUNNER_DIR}/run
+
+          # Start tailscaled with completely isolated state and socket
           sudo tailscaled \
-            --statedir=/tmp/tailscale-runner/state \
-            --socket=/tmp/tailscale-runner/run/tailscaled.sock \
+            --statedir=${RUNNER_DIR}/state \
+            --socket=${RUNNER_DIR}/run/tailscaled.sock \
             --tun=userspace-networking \
-            > /tmp/tailscale-runner/tailscaled.log 2>&1 &
+            > ${RUNNER_DIR}/tailscaled.log 2>&1 &
           
+          TAILSCALED_PID=$!
           sleep 3
+
+          # Verify the daemon started
+          if ! sudo tailscale --socket=${RUNNER_DIR}/run/tailscaled.sock status &>/dev/null; then
+            echo "tailscaled failed to start. Logs:"
+            cat ${RUNNER_DIR}/tailscaled.log
+            exit 1
+          fi
 
           # Bring up tailscale using the isolated socket
           sudo -E tailscale \
-            --socket=/tmp/tailscale-runner/run/tailscaled.sock \
+            --socket=${RUNNER_DIR}/run/tailscaled.sock \
             up \
             --authkey=${TS_AUTHKEY} \
             --hostname=github-runner-${GITHUB_RUN_ID} \
@@ -51,10 +62,10 @@ jobs:
           # Wait and verify
           sleep 3
           echo "Tailscale status:"
-          sudo tailscale --socket=/tmp/tailscale-runner/run/tailscaled.sock status
+          sudo tailscale --socket=${RUNNER_DIR}/run/tailscaled.sock status
 
           # Print connection info
-          TAILSCALE_IP=$(sudo tailscale --socket=/tmp/tailscale-runner/run/tailscaled.sock ip -4)
+          TAILSCALE_IP=$(sudo tailscale --socket=${RUNNER_DIR}/run/tailscaled.sock ip -4)
           echo ""
           echo "=========================================="
           echo "Runner is now on your tailnet!"
@@ -68,6 +79,9 @@ jobs:
           echo "Or use the hostname:"
           echo "  tailscale ssh runner@github-runner-${GITHUB_RUN_ID}"
           echo "=========================================="
+
+          # Save PID for cleanup
+          echo ${TAILSCALED_PID} > ${RUNNER_DIR}/tailscaled.pid
 
       - name: Setup SSH server
         run: |
