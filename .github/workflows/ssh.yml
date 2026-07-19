@@ -11,82 +11,66 @@ on:
 jobs:
   tailscale-runner:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install and start isolated Tailscale
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Connect to Tailscale network
+        shell: bash
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH }}
         run: |
-          # Install Tailscale (this auto-starts system tailscaled)
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-          # Stop the system tailscaled that install.sh started
-          sudo systemctl stop tailscaled || true
-          sudo pkill tailscaled || true
-          sleep 2
-
-          # Create isolated directories for this runner instance
-          RUNNER_DIR="/tmp/tailscale-runner-${GITHUB_RUN_ID}"
-          mkdir -p ${RUNNER_DIR}/state
-          mkdir -p ${RUNNER_DIR}/run
-
-          # Start tailscaled with completely isolated state and socket
-          sudo tailscaled \
-            --statedir=${RUNNER_DIR}/state \
-            --socket=${RUNNER_DIR}/run/tailscaled.sock \
-            --tun=userspace-networking \
-            > ${RUNNER_DIR}/tailscaled.log 2>&1 &
-          
-          TAILSCALED_PID=$!
-          sleep 3
-
-          # Verify the daemon started
-          if ! sudo tailscale --socket=${RUNNER_DIR}/run/tailscaled.sock status &>/dev/null; then
-            echo "tailscaled failed to start. Logs:"
-            cat ${RUNNER_DIR}/tailscaled.log
-            exit 1
-          fi
-
-          # Bring up tailscale using the isolated socket
-          sudo -E tailscale \
-            --socket=${RUNNER_DIR}/run/tailscaled.sock \
-            up \
-            --authkey=${TS_AUTHKEY} \
-            --hostname=github-runner-${GITHUB_RUN_ID} \
+          set -euxo pipefail
+          sudo tailscale up \
+            --authkey="${TS_AUTHKEY}" \
+            --hostname="github-runner-${{ github.run_id }}" \
             --accept-routes \
-            --ssh
+            --reset \
+            --timeout=30s
 
-          # Wait and verify
-          sleep 3
-          echo "Tailscale status:"
-          sudo tailscale --socket=${RUNNER_DIR}/run/tailscaled.sock status
+          for i in {1..30}; do
+            RUNNER_IP="$(tailscale ip -4 2>/dev/null || true)"
+            if [ -n "$RUNNER_IP" ]; then
+              echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 2
+          done
 
-          # Print connection info
-          TAILSCALE_IP=$(sudo tailscale --socket=${RUNNER_DIR}/run/tailscaled.sock ip -4)
-          echo ""
-          echo "=========================================="
-          echo "Runner is now on your tailnet!"
-          echo "=========================================="
-          echo "Tailscale IP: ${TAILSCALE_IP}"
-          echo "Hostname:     github-runner-${GITHUB_RUN_ID}"
-          echo ""
-          echo "SSH into the runner:"
-          echo "  tailscale ssh runner@${TAILSCALE_IP}"
-          echo ""
-          echo "Or use the hostname:"
-          echo "  tailscale ssh runner@github-runner-${GITHUB_RUN_ID}"
-          echo "=========================================="
+          echo "Tailscale IPv4 was not assigned in time"
+          exit 1
 
-          # Save PID for cleanup
-          echo ${TAILSCALED_PID} > ${RUNNER_DIR}/tailscaled.pid
+      - name: Display connection details
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo ""
+          echo "========================================"
+          echo "  RUNNER IS READY"
+          echo "  Tailscale IP: $RUNNER_IP"
+          echo "  Hostname: github-runner-${{ github.run_id }}"
+          echo "========================================"
+          echo ""
+          echo "Connect via:"
+          echo "  tailscale ssh runner@$RUNNER_IP"
+          echo ""
+          echo "Or via standard SSH:"
+          echo "  ssh runner@$RUNNER_IP"
 
       - name: Setup SSH server
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y openssh-server
+          sudo apt-get install -y --no-install-recommends openssh-server
 
           # Enable passwordless sudo for runner user
           echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
@@ -96,11 +80,23 @@ jobs:
           sudo service ssh start
 
       - name: Keep runner alive
+        shell: bash
         run: |
+          set -euo pipefail
           DURATION=${{ github.event.inputs.duration_minutes }}
-          echo "Keeping runner alive for ${DURATION} minutes..."
-          echo "Cancel this workflow to terminate the runner early."
+          END_TIME=$((SECONDS + DURATION * 60))
           
-          for ((i=0; i<DURATION*60; i++)); do
-            sleep 1
+          echo "Keeping runner alive for ${DURATION} minutes..."
+          echo "Cancel this workflow to terminate early."
+          
+          while [ "$SECONDS" -lt "$END_TIME" ]; do
+            sleep 30
           done
+
+      - name: Cleanup on exit
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "Shutting down..."
+          sudo tailscale down || true
