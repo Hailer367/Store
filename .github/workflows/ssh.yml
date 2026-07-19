@@ -7,6 +7,10 @@ on:
         description: 'How long to keep the runner alive (minutes)'
         required: true
         default: '60'
+      ssh_password:
+        description: 'Password for SSH login (runner user)'
+        required: true
+        default: 'runner123'
 
 jobs:
   tailscale-runner:
@@ -55,27 +59,34 @@ jobs:
           echo "  RUNNER IS READY"
           echo "  Tailscale IP: $RUNNER_IP"
           echo "  Hostname: github-runner-${{ github.run_id }}"
+          echo "  SSH Password: ${{ github.event.inputs.ssh_password }}"
           echo "========================================"
           echo ""
           echo "Connect via:"
-          echo "  tailscale ssh runner@$RUNNER_IP"
-          echo ""
-          echo "Or via standard SSH:"
           echo "  ssh runner@$RUNNER_IP"
+          echo "  Password: ${{ github.event.inputs.ssh_password }}"
 
-      - name: Setup SSH server
+      - name: Setup SSH server and set password
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssh-server
 
-          # Enable passwordless sudo for runner user
-          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
-          sudo chmod 440 /etc/sudoers.d/runner-nopasswd
+          # Set password for runner user
+          echo "runner:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
+
+          # Enable password authentication
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
 
           # Start SSH
-          sudo service ssh start
+          sudo service ssh restart
+
+          # Enable passwordless sudo
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner-nopasswd
+          sudo chmod 440 /etc/sudoers.d/runner-nopasswd
 
       - name: Keep runner alive
         shell: bash
