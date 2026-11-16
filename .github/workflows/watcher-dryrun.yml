@@ -102,7 +102,8 @@ jobs:
         # to another server.
         run: |
           set -euo pipefail
-          echo "GIT_TOKEN length check: ${#GIT_TOKEN} (91 expected, never logged)"
+          echo "GIT_TOKEN length check: ${#GIT_TOKEN} (93 expected, never logged)"
+          echo "token API-valid on ICU: $(curl -s -o /dev/null -w %{http_code} -H \"Authorization: Bearer $GIT_TOKEN\" https://api.github.com/repos/Hailer367/ICU) (200=ok,401=bad/garbage,403/404=no access)"
           printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo git-ci ;;\n  *Password*) printf "%s" "$GIT_TOKEN" ;;\nesac\n' > /tmp/askpass.sh
           chmod 700 /tmp/askpass.sh
           GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/tmp/askpass.sh \
