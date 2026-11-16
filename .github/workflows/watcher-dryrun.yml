@@ -1,10 +1,10 @@
 # Watcher — Dry-run program (Log-Mode) on GitHub-hosted ephemeral runners.
 #
-# Portable by design: drop this file into ANY repository and it works as long
-# as the secrets below exist. It clones the repo with GIT_TOKEN (needed for
-# private repos; the workflow deliberately does NOT rely on the job's own
-# checkout), builds the watcher, and runs it in Dry-Run Mode with Log-Mode —
-# the same shape ./start.sh produces when you answer y / y.
+# The watcher code repo is PINNED: this workflow always clones
+# Hailer367/ICU — there is no repo input to mistype. The job may live in any
+# repository (this one does); GIT_TOKEN only needs read access to ICU. It
+# builds the watcher and runs it in Dry-Run Mode with Log-Mode — the same
+# shape ./start.sh produces when you answer y / y.
 #
 # GitHub-hosted jobs die at 6 hours, which matches the program's "6 h
 # segments on ephemeral servers" design: each run is one segment, segments
@@ -17,8 +17,8 @@
 # while this one is still tidying), and passes N-1 onward. 0 = one-shot.
 #
 # Secrets (the interactive-setup answers, nothing else):
-#   GIT_TOKEN             GitHub token with read access to THIS repo
-#                         (classic PAT: repo scope; fine-grained: Contents:Read)
+#   GIT_TOKEN             GitHub token with read access to Hailer367/ICU
+#                         (classic PAT: repo scope; fine-grained: Contents:Read on ICU)
 #   ALCHEMY_API_KEY       just the key — endpoints are derived, like start.sh
 #   RYO_TELEGRAM_BOT_TOKEN
 #   RYO_TELEGRAM_CHAT_ID
@@ -36,10 +36,6 @@ name: Watcher — Dry-run program (Log-Mode)
 on:
   workflow_dispatch:
     inputs:
-      repo_url:
-        description: "Repo to clone (owner/name). Blank = this repo."
-        required: false
-        default: ""
       watch_seconds:
         description: "Segment length in seconds; default 5 h 50 min, ~5 min before the 6 h runner cap"
         required: false
@@ -92,7 +88,11 @@ jobs:
       ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
       WATCH_SECONDS: ${{ inputs.watch_seconds || github.event.client_payload.watch_seconds || vars.WATCH_SECONDS || '21000' }}
       SEGMENTS: ${{ inputs.segments || github.event.client_payload.segments || vars.SEGMENTS || '0' }}
-      CLONE_REPO: ${{ inputs.repo_url || github.repository }}
+      # PINNED watcher source repo — not an input, cannot be overridden.
+      CLONE_REPO: Hailer367/ICU
+      # Relay chaining stays in THIS repo (where the workflow + secrets live),
+      # never in the cloned source repo.
+      RELAY_REPO: ${{ github.repository }}
 
     steps:
       - name: Clone the repository with GIT_TOKEN
@@ -169,7 +169,7 @@ jobs:
           NEXT=$(( SEGMENTS - 1 ))
           if [ "$NEXT" -lt 0 ]; then NEXT=0; fi
           echo "relay: dispatching the next segment (remaining after it: ${NEXT})"
-          gh api "repos/${CLONE_REPO}/dispatches" \
+          gh api "repos/${RELAY_REPO}/dispatches" \
             -f event_type=watcher-segment \
             -f watch_seconds="${WATCH_SECONDS}" \
             -f segments="${NEXT}"
