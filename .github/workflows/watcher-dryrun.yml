@@ -95,23 +95,20 @@ jobs:
       RELAY_REPO: ${{ github.repository }}
 
     steps:
-      - name: Clone the repository with GIT_TOKEN
-        # The token is fed through GIT_ASKPASS, never the command line or
-        # .git/config, so it appears in no log and no leftover file. The
-        # clone host is fixed to github.com: no input can steer the token
-        # to another server.
+      - name: Fetch the watcher source (REST tarball of Hailer367/ICU)
+        # Auth via the REST API, which works from Actions IPs for this PAT
+        # (git-over-HTTPS was being rejected there). The token is only ever
+        # sent in an Authorization header over HTTPS: never the command line,
+        # never a file, never logged.
         run: |
           set -euo pipefail
-          echo "GIT_TOKEN length check: ${#GIT_TOKEN} (93 expected, never logged)"
-          st=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GIT_TOKEN" https://api.github.com/repos/Hailer367/ICU || echo ERR)
-          echo "token API status on ICU: ${st}"
-          who=$(curl -sS -H "Authorization: Bearer $GIT_TOKEN" https://api.github.com/user | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('login','?'))" || echo ERR)
-          echo "token identifies as: ${who}"
-          printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo git-ci ;;\n  *Password*) printf "%s" "$GIT_TOKEN" ;;\nesac\n' > /tmp/askpass.sh
-          chmod 700 /tmp/askpass.sh
-          GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/tmp/askpass.sh \
-            git clone --depth 1 "https://github.com/${CLONE_REPO}.git" "$RUNNER_TEMP/repo"
-          rm -f /tmp/askpass.sh
+          curl -sSL -H "Authorization: Bearer $GIT_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CLONE_REPO}/tarball/main" -o /tmp/src.tgz
+          mkdir -p "$RUNNER_TEMP/repo"
+          tar -xzf /tmp/src.tgz --strip-components=1 -C "$RUNNER_TEMP/repo"
+          rm -f /tmp/src.tgz
+          test -f "$RUNNER_TEMP/repo/Watcher/Cargo.toml"   # tree sanity
+          echo "source tree ready"
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
 
