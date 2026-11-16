@@ -1,0 +1,198 @@
+# Watcher — Dry-run program (Log-Mode) on GitHub-hosted ephemeral runners.
+#
+# Portable by design: drop this file into ANY repository and it works as long
+# as the secrets below exist. It clones the repo with GIT_TOKEN (needed for
+# private repos; the workflow deliberately does NOT rely on the job's own
+# checkout), builds the watcher, and runs it in Dry-Run Mode with Log-Mode —
+# the same shape ./start.sh produces when you answer y / y.
+#
+# GitHub-hosted jobs die at 6 hours, which matches the program's "6 h
+# segments on ephemeral servers" design: each run is one segment, segments
+# are stitched later by timestamp in the database (the watcher writes a runs
+# start/stop row per process, and SIGTERM drains + flushes on the way out).
+#
+# Relay chaining: set "segments" to N and every finished segment gracefully
+# stops the watcher (drain + flush + runs stop row), dispatches the NEXT
+# segment immediately (before its own log upload, so the new runner boots
+# while this one is still tidying), and passes N-1 onward. 0 = one-shot.
+#
+# Secrets (the interactive-setup answers, nothing else):
+#   GIT_TOKEN             GitHub token with read access to THIS repo
+#                         (classic PAT: repo scope; fine-grained: Contents:Read)
+#   ALCHEMY_API_KEY       just the key — endpoints are derived, like start.sh
+#   RYO_TELEGRAM_BOT_TOKEN
+#   RYO_TELEGRAM_CHAT_ID
+#   TELEGRAM_ADMIN_USER_IDS   optional (blank = any chat member)
+#   SUPABASE_URL          https://<project>.supabase.co
+#   SUPABASE_KEY          the sb_secret_ / service-role key
+#   SUPABASE_PREFIX       optional (default ryo_)
+#
+# Optional repo Variables (Settings → Secrets and variables → Actions →
+# Variables): WATCH_SECONDS (segment length, default 21000 = 5 h 50 min),
+# SEGMENTS (chain depth for cron-triggered segments, default 0).
+
+name: Watcher — Dry-run program (Log-Mode)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "Repo to clone (owner/name). Blank = this repo."
+        required: false
+        default: ""
+      watch_seconds:
+        description: "Segment length in seconds; default 5 h 50 min, ~5 min before the 6 h runner cap"
+        required: false
+        default: "21000"
+      segments:
+        description: "Extra segments to start after this one (0 = one-shot, 1 = run one more, N = chain N more)"
+        required: false
+        default: "0"
+  # One segment every 6 hours while enabled. GitHub crons are best-effort and
+  # can be delayed under load; the concurrency group below guarantees at most
+  # one live segment regardless. Cron segments chain vars.SEGMENTS further.
+  schedule:
+    - cron: "5 0,6,12,18 * * *"
+  repository_dispatch:
+    types: [watcher-segment]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watcher-dryrun
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    # GitHub's ceiling. The 21000 s segment starts ~2-3 min into the job
+    # (clone+build) and ends ~5 h 53 min; drain + relay + upload finish by
+    # ~5 h 56. Anything lower would cancel the workflow mid-cleanup.
+    timeout-minutes: 360
+    env:
+      # The interactive setup's answers, mapped 1:1:
+      #   "Run in Dry-Run Mode? y"     -> RYO_MODE + RYO_LOCAL_SIM below
+      #   "Enable Log-Mode? y"         -> RYO_LOG_MODE below
+      RYO_MODE: dry-run
+      RYO_LOCAL_SIM: "1"
+      RYO_LOG_MODE: "1"
+      # start.sh's dry-run cost defaults (unchanged):
+      RYO_NO_HEADS: "1"
+      RYO_ALL_LOGS: "0"
+      RYO_SOURCE: logs
+      RYO_METRICS_EVERY: "1000"
+      # From secrets:
+      RYO_TELEGRAM_BOT_TOKEN: ${{ secrets.RYO_TELEGRAM_BOT_TOKEN }}
+      RYO_TELEGRAM_CHAT_ID: ${{ secrets.RYO_TELEGRAM_CHAT_ID }}
+      RYO_TELEGRAM_ADMIN_USER_IDS: ${{ secrets.TELEGRAM_ADMIN_USER_IDS }}
+      RYO_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      RYO_SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      RYO_SUPABASE_PREFIX: ${{ secrets.SUPABASE_PREFIX || 'ryo_' }}
+      ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+      WATCH_SECONDS: ${{ inputs.watch_seconds || github.event.client_payload.watch_seconds || vars.WATCH_SECONDS || '21000' }}
+      SEGMENTS: ${{ inputs.segments || github.event.client_payload.segments || vars.SEGMENTS || '0' }}
+      CLONE_REPO: ${{ inputs.repo_url || github.repository }}
+
+    steps:
+      - name: Clone the repository with GIT_TOKEN
+        # The token is fed through GIT_ASKPASS, never the command line or
+        # .git/config, so it appears in no log and no leftover file. The
+        # clone host is fixed to github.com: no input can steer the token
+        # to another server.
+        run: |
+          set -euo pipefail
+          printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo x-access-token ;;\n  *Password*) printf "%s" "$GIT_TOKEN" ;;\nesac\n' > /tmp/askpass.sh
+          chmod 700 /tmp/askpass.sh
+          GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/tmp/askpass.sh \
+            git clone --depth 1 "https://github.com/${CLONE_REPO}.git" "$RUNNER_TEMP/repo"
+          rm -f /tmp/askpass.sh
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ runner.temp }}/repo/Watcher
+
+      - name: Build the watcher (release)
+        working-directory: ${{ runner.temp }}/repo/Watcher
+        run: cargo build --release
+
+      - name: Preflight — config sanity (no network)
+        working-directory: ${{ runner.temp }}/repo/Watcher
+        run: |
+          set -euo pipefail
+          for v in ALCHEMY_API_KEY RYO_TELEGRAM_BOT_TOKEN RYO_TELEGRAM_CHAT_ID RYO_SUPABASE_URL RYO_SUPABASE_KEY; do
+            if [ -z "${!v:-}" ]; then echo "::error::secret $v is not configured"; exit 1; fi
+          done
+          case "$WATCH_SECONDS" in (*[!0-9]*|'') echo "::error::WATCH_SECONDS must be a number"; exit 1;; esac
+          case "$SEGMENTS" in (*[!0-9]*|'') echo "::error::segments must be a number (0 = one-shot)"; exit 1;; esac
+          test -f deployments/8453.observer.json
+          ./target/release/ryo-watch --help >/dev/null
+
+      - name: Run one dry-run segment (Log-Mode)
+        working-directory: ${{ runner.temp }}/repo/Watcher
+        run: |
+          set -uo pipefail
+          export RYO_WS_RPC="wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+          export RYO_HTTP_RPC="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+          echo "segment length: ${WATCH_SECONDS}s (ends with SIGTERM -> graceful drain + runs stop row)"
+          timeout -s TERM --kill-after 90 "${WATCH_SECONDS}" \
+            ./target/release/ryo-watch \
+              --ws-rpc "$RYO_WS_RPC" --http-rpc "$RYO_HTTP_RPC" \
+              --local-sim --manifest deployments/8453.observer.json \
+              --source logs \
+              watch --show-empty --metrics-every "${RYO_METRICS_EVERY}" \
+            2>&1 | tee "$RUNNER_TEMP/watch.log"
+          ec=${PIPESTATUS[0]}
+          # 124 = timeout fired (a segment that ran its full length: success).
+          if [ "$ec" -eq 124 ]; then ec=0; fi
+          echo "WATCH_EXIT=$ec" >> "$GITHUB_ENV"
+          exit "$ec"
+
+      - name: Relay — start the next segment now (opt-in chain)
+        # Runs BEFORE the log upload so the successor runner boots while this
+        # one is still tidying: the watcher was already SIGTERM'd and drained
+        # in the previous step; the database never sees a longer gap than the
+        # runner handover. segments=0 stops the chain; each relay passes N-1.
+        if: always() && env.SEGMENTS != '0'
+        run: |
+          set -euo pipefail
+          if [ "${WATCH_EXIT:-1}" -ne 0 ]; then
+            echo "watcher exited with ${WATCH_EXIT}; not relaying (a broken build should not chain)"
+            exit 0
+          fi
+          NEXT=$(( SEGMENTS - 1 ))
+          if [ "$NEXT" -lt 0 ]; then NEXT=0; fi
+          echo "relay: dispatching the next segment (remaining after it: ${NEXT})"
+          gh api "repos/${CLONE_REPO}/dispatches" \
+            -f event_type=watcher-segment \
+            -f watch_seconds="${WATCH_SECONDS}" \
+            -f segments="${NEXT}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload segment log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watcher-segment-${{ github.run_number }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/watch.log
+          if-no-files-found: warn
+
+      - name: Summary (no secrets, ever)
+        if: always()
+        run: |
+          {
+            echo "## Watcher dry-run segment #${{ github.run_number }}"
+            echo ""
+            echo "- exit handling: \`timeout -s TERM\` -> graceful drain, \`runs\` stop row written"
+            grep -o 'events=[0-9]* scans=[0-9]* skipped=[0-9]* failed=[0-9]*' "$RUNNER_TEMP/watch.log" | tail -1 | sed 's/^/- counters: `/' | sed 's/$/`/' || true
+            grep -o 'reason="[a-zA-Z ]*"' "$RUNNER_TEMP/watch.log" | tail -1 | sed 's/^/- stop: /' || true
+            echo "- relay: segments remaining was \`${SEGMENTS}\`; next chain starts only on a clean exit"
+            echo "- decisions live in the Supabase project; audit replays them offline"
+          } >> "$GITHUB_STEP_SUMMARY"
