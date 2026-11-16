@@ -102,7 +102,7 @@ jobs:
         # to another server.
         run: |
           set -euo pipefail
-          printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo x-access-token ;;\n  *Password*) printf "%s" "$GIT_TOKEN" ;;\nesac\n' > /tmp/askpass.sh
+          printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo git-ci ;;\n  *Password*) printf "%s" "$GIT_TOKEN" ;;\nesac\n' > /tmp/askpass.sh
           chmod 700 /tmp/askpass.sh
           GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/tmp/askpass.sh \
             git clone --depth 1 "https://github.com/${CLONE_REPO}.git" "$RUNNER_TEMP/repo"
