@@ -102,6 +102,7 @@ jobs:
         # to another server.
         run: |
           set -euo pipefail
+          echo "GIT_TOKEN length check: ${#GIT_TOKEN} (91 expected, never logged)"
           printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo git-ci ;;\n  *Password*) printf "%s" "$GIT_TOKEN" ;;\nesac\n' > /tmp/askpass.sh
           chmod 700 /tmp/askpass.sh
           GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/tmp/askpass.sh \
