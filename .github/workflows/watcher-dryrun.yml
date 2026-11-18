@@ -19,7 +19,17 @@
 # Secrets (the interactive-setup answers, nothing else):
 #   GIT_TOKEN             GitHub token with read access to Hailer367/ICU
 #                         (classic PAT: repo scope; fine-grained: Contents:Read on ICU)
-#   ALCHEMY_API_KEY       just the key — endpoints are derived, like start.sh
+#   ALCHEMY_API_KEY       just the key — endpoints are derived, like start.sh.
+#                         REQUIRED unless BASE_WS_URL + BASE_HTTP_URL are set.
+#   BASE_WS_URL           optional full WebSocket endpoint (e.g.
+#                         wss://base-rpc.publicnode.com). Together with
+#                         BASE_HTTP_URL it REPLACES the Alchemy derivation —
+#                         the run then costs zero Alchemy CU. Set BOTH or
+#                         neither.
+#   BASE_HTTP_URL         optional HTTP RPC paired with BASE_WS_URL (same
+#                         host, e.g. https://base-rpc.publicnode.com — the
+#                         watcher only trusts one endpoint's heads/pins when
+#                         subscriptions and reads share it).
 #   RYO_TELEGRAM_BOT_TOKEN
 #   RYO_TELEGRAM_CHAT_ID
 #   TELEGRAM_ADMIN_USER_IDS   optional (blank = any chat member)
@@ -29,7 +39,15 @@
 #
 # Optional repo Variables (Settings → Secrets and variables → Actions →
 # Variables): WATCH_SECONDS (segment length, default 21000 = 5 h 50 min),
-# SEGMENTS (chain depth for cron-triggered segments, default 0).
+# SEGMENTS (chain depth for dispatched segments, default 0),
+# WATCH_HEADS ("1" to subscribe newHeads; default "0" = off, the Alchemy
+# cost shape — use "1" on a free endpoint, it buys the zero-RTT socket pin
+# and head-gap detection at no cost).
+#
+# Scheduling: there is NO cron trigger — every segment starts from an
+# explicit workflow_dispatch (set segments=N to chain N more after it) or
+# the relay's repository_dispatch. Unattended full days are opt-in per
+# dispatch, never automatic.
 
 name: Watcher — Dry-run program (Log-Mode)
 
@@ -44,16 +62,17 @@ on:
         description: "Extra segments to start after this one (0 = one-shot, 1 = run one more, N = chain N more)"
         required: false
         default: "0"
-  # One segment every 6 hours while enabled. GitHub crons are best-effort and
-  # can be delayed under load; the concurrency group below guarantees at most
-  # one live segment regardless. Cron segments chain vars.SEGMENTS further.
-  schedule:
-    - cron: "5 0,6,12,18 * * *"
+  # No schedule: segments start only on explicit dispatch, or when the relay
+  # of a running chain dispatches the next one (repository_dispatch below).
   repository_dispatch:
     types: [watcher-segment]
 
 permissions:
   contents: read
+  # The relay step creates a repository_dispatch event with the job's
+  # GITHUB_TOKEN; without actions:write that token cannot call the
+  # dispatches endpoint and segment chaining dies with a 403.
+  actions: write
 
 concurrency:
   group: watcher-dryrun
@@ -73,11 +92,17 @@ jobs:
       RYO_MODE: dry-run
       RYO_LOCAL_SIM: "1"
       RYO_LOG_MODE: "1"
-      # start.sh's dry-run cost defaults (unchanged):
+      # start.sh's dry-run cost defaults (heads subscription decided per
+      # endpoint below: off for Alchemy billing, settable for free endpoints):
       RYO_NO_HEADS: "1"
       RYO_ALL_LOGS: "0"
       RYO_SOURCE: logs
       RYO_METRICS_EVERY: "1000"
+      # Endpoint choice: BASE_WS_URL + BASE_HTTP_URL (both, or neither)
+      # replace the Alchemy-derived URLs; env vars, never interpolated
+      # command lines.
+      BASE_WS_URL: ${{ secrets.BASE_WS_URL }}
+      BASE_HTTP_URL: ${{ secrets.BASE_HTTP_URL }}
       # From secrets:
       RYO_TELEGRAM_BOT_TOKEN: ${{ secrets.RYO_TELEGRAM_BOT_TOKEN }}
       RYO_TELEGRAM_CHAT_ID: ${{ secrets.RYO_TELEGRAM_CHAT_ID }}
@@ -86,6 +111,7 @@ jobs:
       RYO_SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       RYO_SUPABASE_PREFIX: ${{ secrets.SUPABASE_PREFIX || 'ryo_' }}
       ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+      WATCH_HEADS: ${{ vars.WATCH_HEADS }}
       WATCH_SECONDS: ${{ inputs.watch_seconds || github.event.client_payload.watch_seconds || vars.WATCH_SECONDS || '21000' }}
       SEGMENTS: ${{ inputs.segments || github.event.client_payload.segments || vars.SEGMENTS || '0' }}
       # PINNED watcher source repo — not an input, cannot be overridden.
@@ -128,9 +154,19 @@ jobs:
         working-directory: ${{ runner.temp }}/repo/Watcher
         run: |
           set -euo pipefail
-          for v in ALCHEMY_API_KEY RYO_TELEGRAM_BOT_TOKEN RYO_TELEGRAM_CHAT_ID RYO_SUPABASE_URL RYO_SUPABASE_KEY; do
+          for v in RYO_TELEGRAM_BOT_TOKEN RYO_TELEGRAM_CHAT_ID RYO_SUPABASE_URL RYO_SUPABASE_KEY; do
             if [ -z "${!v:-}" ]; then echo "::error::secret $v is not configured"; exit 1; fi
           done
+          # Endpoint: either both custom URLs, or the Alchemy key that derives them.
+          if [ -n "${BASE_WS_URL:-}" ] || [ -n "${BASE_HTTP_URL:-}" ]; then
+            if [ -z "${BASE_WS_URL:-}" ] || [ -z "${BASE_HTTP_URL:-}" ]; then
+              echo "::error::BASE_WS_URL and BASE_HTTP_URL must be set together"; exit 1
+            fi
+            case "$BASE_WS_URL" in wss://*) ;; *) echo "::error::BASE_WS_URL must start with wss://"; exit 1;; esac
+            case "$BASE_HTTP_URL" in https://*) ;; *) echo "::error::BASE_HTTP_URL must start with https://"; exit 1;; esac
+          elif [ -z "${ALCHEMY_API_KEY:-}" ]; then
+            echo "::error::no endpoint: set ALCHEMY_API_KEY or BASE_WS_URL + BASE_HTTP_URL"; exit 1
+          fi
           case "$WATCH_SECONDS" in (*[!0-9]*|'') echo "::error::WATCH_SECONDS must be a number"; exit 1;; esac
           case "$SEGMENTS" in (*[!0-9]*|'') echo "::error::segments must be a number (0 = one-shot)"; exit 1;; esac
           test -f deployments/8453.observer.json
@@ -140,8 +176,21 @@ jobs:
         working-directory: ${{ runner.temp }}/repo/Watcher
         run: |
           set -uo pipefail
-          export RYO_WS_RPC="wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
-          export RYO_HTTP_RPC="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+          if [ -n "${BASE_WS_URL:-}" ]; then
+            export RYO_WS_RPC="$BASE_WS_URL"
+            export RYO_HTTP_RPC="$BASE_HTTP_URL"
+            echo "endpoint: custom (free provider — zero Alchemy CU)"
+          else
+            export RYO_WS_RPC="wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+            export RYO_HTTP_RPC="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
+            echo "endpoint: Alchemy (derived from key)"
+          fi
+          # newHeads costs ~1.4 M CU/hour on Alchemy (kept off), and is free
+          # plus useful on a custom endpoint — WATCH_HEADS=1 enables it.
+          if [ "${WATCH_HEADS:-}" = "1" ]; then
+            export RYO_NO_HEADS=0
+            echo "heads: ON (socket pin + gap detection)"
+          fi
           echo "segment length: ${WATCH_SECONDS}s (ends with SIGTERM -> graceful drain + runs stop row)"
           timeout -s TERM --kill-after 90 "${WATCH_SECONDS}" \
             ./target/release/ryo-watch \
