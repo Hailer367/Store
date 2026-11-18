@@ -46,7 +46,7 @@
 #
 # Scheduling: there is NO cron trigger — every segment starts from an
 # explicit workflow_dispatch (set segments=N to chain N more after it) or
-# the relay's repository_dispatch. Unattended full days are opt-in per
+# the relay's own dispatch call. Unattended full days are opt-in per
 # dispatch, never automatic.
 
 name: Watcher — Dry-run program (Log-Mode)
@@ -63,15 +63,13 @@ on:
         required: false
         default: "0"
   # No schedule: segments start only on explicit dispatch, or when the relay
-  # of a running chain dispatches the next one (repository_dispatch below).
-  repository_dispatch:
-    types: [watcher-segment]
+  # of a running chain dispatches the next one (workflow_dispatch endpoint).
 
 permissions:
   contents: read
-  # The relay step creates a repository_dispatch event with the job's
-  # GITHUB_TOKEN; without actions:write that token cannot call the
-  # dispatches endpoint and segment chaining dies with a 403.
+  # The relay step calls the workflow_dispatch endpoint with the job's
+  # GITHUB_TOKEN; without actions:write that token cannot dispatch and
+  # segment chaining dies with a 403.
   actions: write
 
 concurrency:
@@ -112,8 +110,8 @@ jobs:
       RYO_SUPABASE_PREFIX: ${{ secrets.SUPABASE_PREFIX || 'ryo_' }}
       ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
       WATCH_HEADS: ${{ vars.WATCH_HEADS }}
-      WATCH_SECONDS: ${{ inputs.watch_seconds || github.event.client_payload.watch_seconds || vars.WATCH_SECONDS || '21000' }}
-      SEGMENTS: ${{ inputs.segments || github.event.client_payload.segments || vars.SEGMENTS || '0' }}
+      WATCH_SECONDS: ${{ inputs.watch_seconds || vars.WATCH_SECONDS || '21000' }}
+      SEGMENTS: ${{ inputs.segments || vars.SEGMENTS || '0' }}
       # PINNED watcher source repo — not an input, cannot be overridden.
       CLONE_REPO: Hailer367/ICU
       # Relay chaining stays in THIS repo (where the workflow + secrets live),
@@ -214,6 +212,10 @@ jobs:
         # one is still tidying: the watcher was already SIGTERM'd and drained
         # in the previous step; the database never sees a longer gap than the
         # runner handover. segments=0 stops the chain; each relay passes N-1.
+        # Mechanism: POST workflow_dispatch on THIS workflow file — the one
+        # chaining endpoint the job's GITHUB_TOKEN (actions:write) is allowed
+        # to call. (repository_dispatch rejects integration tokens outright
+        # with 403 "Resource not accessible by integration" — measured live.)
         if: always() && env.SEGMENTS != '0'
         run: |
           set -euo pipefail
@@ -223,13 +225,15 @@ jobs:
           fi
           NEXT=$(( SEGMENTS - 1 ))
           if [ "$NEXT" -lt 0 ]; then NEXT=0; fi
-          echo "relay: dispatching the next segment (remaining after it: ${NEXT})"
-          gh api "repos/${RELAY_REPO}/dispatches" \
-            -f event_type=watcher-segment \
-            -f watch_seconds="${WATCH_SECONDS}" \
-            -f segments="${NEXT}"
+          echo "relay: dispatching the next segment on ${REF} (remaining after it: ${NEXT})"
+          # WATCH_SECONDS/NEXT are numeric-validated in preflight; only they
+          # reach the JSON payload.
+          printf '{"ref":"%s","inputs":{"watch_seconds":"%s","segments":"%s"}}' \
+            "$REF" "$WATCH_SECONDS" "$NEXT" \
+            | gh api "repos/${RELAY_REPO}/actions/workflows/watcher-dryrun.yml/dispatches" --input -
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.ref_name }}
 
       - name: Upload segment log
         if: always()
