@@ -176,6 +176,10 @@ jobs:
         working-directory: ${{ runner.temp }}/repo/Watcher
         run: |
           set -uo pipefail
+          # Actions runs steps under bash -e: without set +e, the pipeline's
+          # exit 124 below (timeout fired = a segment that ran its FULL length:
+          # success) kills the script before the conversion lines run.
+          set +e
           if [ -n "${BASE_WS_URL:-}" ]; then
             export RYO_WS_RPC="$BASE_WS_URL"
             export RYO_HTTP_RPC="$BASE_HTTP_URL"
@@ -214,7 +218,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${WATCH_EXIT:-1}" -ne 0 ]; then
-            echo "watcher exited with ${WATCH_EXIT}; not relaying (a broken build should not chain)"
+            echo "watcher exited with ${WATCH_EXIT:-<unset>}; not relaying (a broken build should not chain)"
             exit 0
           fi
           NEXT=$(( SEGMENTS - 1 ))
