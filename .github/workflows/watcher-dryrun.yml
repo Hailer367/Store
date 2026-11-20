@@ -1,107 +1,104 @@
-# Watcher — Dry-run program (Log-Mode) on GitHub-hosted ephemeral runners.
+# Watcher — the full bot on GitHub-hosted runners (dry-run / paper / live).
 #
-# The watcher code repo is PINNED: this workflow always clones
-# Hailer367/ICU — there is no repo input to mistype. The job may live in any
-# repository (this one does); GIT_TOKEN only needs read access to ICU. It
-# builds the watcher and runs it in Dry-Run Mode with Log-Mode — the same
-# shape ./start.sh produces when you answer y / y.
+# The watcher CODE repo is pinned: this workflow always clones
+# Hailer367/ICU main and builds it. This file lives in Hailer367/Store
+# (the runtime home) with an identical copy kept in ICU for provenance.
 #
-# GitHub-hosted jobs die at 6 hours, which matches the program's "6 h
-# segments on ephemeral servers" design: each run is one segment, segments
-# are stitched later by timestamp in the database (the watcher writes a runs
-# start/stop row per process, and SIGTERM drains + flushes on the way out).
+# Since §0at the watcher runs against the DEPLOYED RyoCore on Base mainnet
+# (deployments/8453.json, committed): dry-run reads and simulates through
+# the real contract, paper signs real transactions without broadcasting,
+# live broadcasts them. Nothing here is dry-run-specific any more; dry-run
+# is only the DEFAULT mode.
 #
-# Relay chaining: set "segments" to N and every finished segment gracefully
-# stops the watcher (drain + flush + runs stop row), dispatches the NEXT
-# segment immediately (before its own log upload, so the new runner boots
-# while this one is still tidying), and passes N-1 onward. 0 = one-shot.
+# GitHub-hosted jobs die at 6 hours: each run is one segment, segments are
+# stitched by timestamp in the database (Log-Mode) or just chained (paper/
+# live). Relay chaining: "segments" = N dispatches N more after this one
+# (same mode), 0 = one-shot.
 #
-# Secrets (the interactive-setup answers, nothing else):
-#   GIT_TOKEN             GitHub token with read access to Hailer367/ICU
-#                         (classic PAT: repo scope; fine-grained: Contents:Read on ICU)
-#   ALCHEMY_API_KEY       just the key — endpoints are derived, like start.sh.
-#                         REQUIRED unless BASE_WS_URL + BASE_HTTP_URL are set.
-#   BASE_WS_URL           optional full WebSocket endpoint (e.g.
-#                         wss://base-rpc.publicnode.com). Together with
-#                         BASE_HTTP_URL it REPLACES the Alchemy derivation —
-#                         the run then costs zero Alchemy CU. Set BOTH or
-#                         neither.
-#   BASE_HTTP_URL         optional HTTP RPC paired with BASE_WS_URL (same
-#                         host, e.g. https://base-rpc.publicnode.com — the
-#                         watcher only trusts one endpoint's heads/pins when
-#                         subscriptions and reads share it).
-#   RYO_TELEGRAM_BOT_TOKEN
-#   RYO_TELEGRAM_CHAT_ID
+# ⚠ OPERATIONAL RULES — read before arming:
+# 1. Run ONE armed instance at a time. Telegram getUpdates is polled: a
+#    second watcher (this runner OR your own server) conflicts and both
+#    lose messages; two live senders also race the operator nonce.
+# 2. Secrets live inside an ephemeral runner VM for the job's duration.
+#    The on-chain caps (50k USDC / 10 WETH) are the financial boundary —
+#    keep them sized for what a leaked key could justify spending.
+# 3. The owner key (RYO_OWNER_PRIVATE_KEY) is OPTIONAL: it enables the
+#    §0ar Telegram admin commands during a segment. By construction it can
+#    NEVER sign trades (ensure_trade_signer, §0at).
+#
+# Secrets (Store → Settings → Secrets and variables → Actions):
+#   GIT_TOKEN                 read access to Hailer367/ICU (Contents:Read)
+#   ALCHEMY_API_KEY           key → endpoints derived (like start.sh).
+#                             REQUIRED unless BASE_WS_URL + BASE_HTTP_URL set.
+#   BASE_WS_URL / BASE_HTTP_URL  optional free-endpoint pair (publicnode);
+#                             set BOTH or NEITHER. For LIVE mode a fast,
+#                             reliable RPC matters; publicnode is acceptable
+#                             at the current fee floor but Alchemy is better.
+#   RYO_TELEGRAM_BOT_TOKEN / RYO_TELEGRAM_CHAT_ID   notifications + control
 #   TELEGRAM_ADMIN_USER_IDS   optional (blank = any chat member)
-#   SUPABASE_URL          https://<project>.supabase.co
-#   SUPABASE_KEY          the sb_secret_ / service-role key
-#   SUPABASE_PREFIX       optional (default ryo_)
+#   SUPABASE_URL / SUPABASE_KEY / SUPABASE_PREFIX   Log-Mode DB (dry-run only)
+#   RYO_OPERATOR_PRIVATE_KEY  REQUIRED for paper/live; ignored in dry-run
+#   RYO_OWNER_PRIVATE_KEY     optional; enables owner Telegram commands
 #
-# Optional repo Variables (Settings → Secrets and variables → Actions →
-# Variables): WATCH_SECONDS (segment length, default 21000 = 5 h 50 min),
-# SEGMENTS (chain depth for dispatched segments, default 0),
-# WATCH_HEADS ("1" to subscribe newHeads; default "0" = off, the Alchemy
-# cost shape — use "1" on a free endpoint, it buys the zero-RTT socket pin
-# and head-gap detection at no cost).
+# Variables: WATCH_SECONDS (default 21000), SEGMENTS (default 0),
+# WATCH_HEADS ("0"/"1" override; default: OFF for dry-run — the Alchemy CU
+# shape of §0ai — ON for paper/live: socket pin + head-gap detection are
+# worth it when trades are real).
 #
-# Scheduling: there is NO cron trigger — every segment starts from an
-# explicit workflow_dispatch (set segments=N to chain N more after it) or
-# the relay's own dispatch call. Unattended full days are opt-in per
-# dispatch, never automatic.
+# Scheduling: NO cron. Every segment starts from an explicit
+# workflow_dispatch (choose the mode there) or the relay of a chain.
 
-name: Watcher — Dry-run program (Log-Mode)
+name: Watcher — full program (dry-run / paper / live)
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Trading mode (dry-run = never signs; paper = signs, no broadcast; live = broadcasts real trades)"
+        required: false
+        type: choice
+        default: "dry-run"
+        options: [dry-run, paper, live]
+      log_mode:
+        description: "Log-Mode: record every decision to Supabase (dry-run only)"
+        required: false
+        type: boolean
+        default: true
       watch_seconds:
-        description: "Segment length in seconds; default 5 h 50 min, ~5 min before the 6 h runner cap"
+        description: "Segment length in seconds; default 5 h 50 min"
         required: false
         default: "21000"
       segments:
-        description: "Extra segments to start after this one (0 = one-shot, 1 = run one more, N = chain N more)"
+        description: "Extra segments to chain after this one (same mode; 0 = one-shot)"
         required: false
         default: "0"
-  # No schedule: segments start only on explicit dispatch, or when the relay
-  # of a running chain dispatches the next one (workflow_dispatch endpoint).
 
 permissions:
   contents: read
-  # The relay step calls the workflow_dispatch endpoint with the job's
-  # GITHUB_TOKEN; without actions:write that token cannot dispatch and
-  # segment chaining dies with a 403.
   actions: write
 
 concurrency:
-  group: watcher-dryrun
+  group: watcher-program
   cancel-in-progress: false
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    # GitHub's ceiling. The 21000 s segment starts ~2-3 min into the job
-    # (clone+build) and ends ~5 h 53 min; drain + relay + upload finish by
-    # ~5 h 56. Anything lower would cancel the workflow mid-cleanup.
     timeout-minutes: 360
     env:
-      # The interactive setup's answers, mapped 1:1:
-      #   "Run in Dry-Run Mode? y"     -> RYO_MODE + RYO_LOCAL_SIM below
-      #   "Enable Log-Mode? y"         -> RYO_LOG_MODE below
-      RYO_MODE: dry-run
-      RYO_LOCAL_SIM: "1"
-      RYO_LOG_MODE: "1"
-      # start.sh's dry-run cost defaults (heads subscription decided per
-      # endpoint below: off for Alchemy billing, settable for free endpoints):
-      RYO_NO_HEADS: "1"
-      RYO_ALL_LOGS: "0"
+      MODE: ${{ inputs.mode || vars.WATCH_MODE || 'dry-run' }}
+      LOG_MODE_IN: ${{ inputs.log_mode }}
+      WATCH_SECONDS: ${{ inputs.watch_seconds || vars.WATCH_SECONDS || '21000' }}
+      SEGMENTS: ${{ inputs.segments || vars.SEGMENTS || '0' }}
+      WATCH_HEADS: ${{ vars.WATCH_HEADS }}
+      # start.sh's production shape minus the local-sim fallback: the
+      # deployed-core path (§0at).
       RYO_SOURCE: logs
       RYO_METRICS_EVERY: "1000"
-      # Endpoint choice: BASE_WS_URL + BASE_HTTP_URL (both, or neither)
-      # replace the Alchemy-derived URLs; env vars, never interpolated
-      # command lines.
+      RYO_ALL_LOGS: "0"
+      RYO_MANIFEST: deployments/8453.json
       BASE_WS_URL: ${{ secrets.BASE_WS_URL }}
       BASE_HTTP_URL: ${{ secrets.BASE_HTTP_URL }}
-      # From secrets:
       RYO_TELEGRAM_BOT_TOKEN: ${{ secrets.RYO_TELEGRAM_BOT_TOKEN }}
       RYO_TELEGRAM_CHAT_ID: ${{ secrets.RYO_TELEGRAM_CHAT_ID }}
       RYO_TELEGRAM_ADMIN_USER_IDS: ${{ secrets.TELEGRAM_ADMIN_USER_IDS }}
@@ -109,21 +106,15 @@ jobs:
       RYO_SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       RYO_SUPABASE_PREFIX: ${{ secrets.SUPABASE_PREFIX || 'ryo_' }}
       ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
-      WATCH_HEADS: ${{ vars.WATCH_HEADS }}
-      WATCH_SECONDS: ${{ inputs.watch_seconds || vars.WATCH_SECONDS || '21000' }}
-      SEGMENTS: ${{ inputs.segments || vars.SEGMENTS || '0' }}
-      # PINNED watcher source repo — not an input, cannot be overridden.
+      # Keys enter the environment ONLY as secret references — never on a
+      # command line, never in a file, never echoed.
+      RYO_OPERATOR_PRIVATE_KEY: ${{ secrets.RYO_OPERATOR_PRIVATE_KEY }}
+      RYO_OWNER_PRIVATE_KEY: ${{ secrets.RYO_OWNER_PRIVATE_KEY }}
       CLONE_REPO: Hailer367/ICU
-      # Relay chaining stays in THIS repo (where the workflow + secrets live),
-      # never in the cloned source repo.
       RELAY_REPO: ${{ github.repository }}
 
     steps:
-      - name: Fetch the watcher source (REST tarball of Hailer367/ICU)
-        # Auth via the REST API, which works from Actions IPs for this PAT
-        # (git-over-HTTPS was being rejected there). The token is only ever
-        # sent in an Authorization header over HTTPS: never the command line,
-        # never a file, never logged.
+      - name: Fetch the watcher source (REST tarball of the pinned repo)
         run: |
           set -euo pipefail
           curl -sSL -H "Authorization: Bearer $GIT_TOKEN" -H "Accept: application/vnd.github+json" \
@@ -131,7 +122,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/repo"
           tar -xzf /tmp/src.tgz --strip-components=1 -C "$RUNNER_TEMP/repo"
           rm -f /tmp/src.tgz
-          test -f "$RUNNER_TEMP/repo/Watcher/Cargo.toml"   # tree sanity
+          test -f "$RUNNER_TEMP/repo/Watcher/Cargo.toml"
           echo "source tree ready"
         env:
           GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
@@ -148,35 +139,46 @@ jobs:
         working-directory: ${{ runner.temp }}/repo/Watcher
         run: cargo build --release
 
-      - name: Preflight — config sanity (no network)
+      - name: Preflight — mode, manifest, keys, endpoint (no network)
         working-directory: ${{ runner.temp }}/repo/Watcher
         run: |
           set -euo pipefail
-          for v in RYO_TELEGRAM_BOT_TOKEN RYO_TELEGRAM_CHAT_ID RYO_SUPABASE_URL RYO_SUPABASE_KEY; do
+          case "$MODE" in dry-run|paper|live) ;; *) echo "::error::invalid mode '$MODE'"; exit 1;; esac
+          for v in RYO_TELEGRAM_BOT_TOKEN RYO_TELEGRAM_CHAT_ID; do
             if [ -z "${!v:-}" ]; then echo "::error::secret $v is not configured"; exit 1; fi
           done
-          # Endpoint: either both custom URLs, or the Alchemy key that derives them.
+          # The DEPLOYED core is required now: no --local-sim fallback path.
+          test -f "$RYO_MANIFEST" || { echo "::error::$RYO_MANIFEST missing (deployments/8453.json must be committed)"; exit 1; }
+          if [ "$MODE" != "dry-run" ] && [ -z "${RYO_OPERATOR_PRIVATE_KEY:-}" ]; then
+            echo "::error::$MODE needs the RYO_OPERATOR_PRIVATE_KEY secret (the owner key can never trade — by construction)"; exit 1
+          fi
+          # Log-Mode: dry-run feature (the binary refuses it otherwise).
+          LOG_MODE=0
+          if [ "$MODE" = "dry-run" ] && { [ "$LOG_MODE_IN" = "true" ] || [ -z "$LOG_MODE_IN" ]; }; then
+            for v in RYO_SUPABASE_URL RYO_SUPABASE_KEY; do
+              if [ -z "${!v:-}" ]; then echo "::error::Log-Mode needs the $v secret"; exit 1; fi
+            done
+            LOG_MODE=1
+          fi
+          echo "LOG_MODE=$LOG_MODE" >> "$GITHUB_ENV"
+          echo "RYO_LOG_MODE=$LOG_MODE" >> "$GITHUB_ENV"
           if [ -n "${BASE_WS_URL:-}" ] || [ -n "${BASE_HTTP_URL:-}" ]; then
             if [ -z "${BASE_WS_URL:-}" ] || [ -z "${BASE_HTTP_URL:-}" ]; then
               echo "::error::BASE_WS_URL and BASE_HTTP_URL must be set together"; exit 1
             fi
-            case "$BASE_WS_URL" in wss://*) ;; *) echo "::error::BASE_WS_URL must start with wss://"; exit 1;; esac
-            case "$BASE_HTTP_URL" in https://*) ;; *) echo "::error::BASE_HTTP_URL must start with https://"; exit 1;; esac
           elif [ -z "${ALCHEMY_API_KEY:-}" ]; then
             echo "::error::no endpoint: set ALCHEMY_API_KEY or BASE_WS_URL + BASE_HTTP_URL"; exit 1
           fi
           case "$WATCH_SECONDS" in (*[!0-9]*|'') echo "::error::WATCH_SECONDS must be a number"; exit 1;; esac
-          case "$SEGMENTS" in (*[!0-9]*|'') echo "::error::segments must be a number (0 = one-shot)"; exit 1;; esac
-          test -f deployments/8453.observer.json
+          case "$SEGMENTS" in (*[!0-9]*|'') echo "::error::segments must be a number"; exit 1;; esac
           ./target/release/ryo-watch --help >/dev/null
+          echo "preflight OK: mode=$MODE log_mode=$LOG_MODE"
 
-      - name: Run one dry-run segment (Log-Mode)
+      - name: Run one segment (chosen mode)
         working-directory: ${{ runner.temp }}/repo/Watcher
         run: |
           set -uo pipefail
-          # Actions runs steps under bash -e: without set +e, the pipeline's
-          # exit 124 below (timeout fired = a segment that ran its FULL length:
-          # success) kills the script before the conversion lines run.
+          # exit 124 = timeout fired = the segment ran its FULL length: success.
           set +e
           if [ -n "${BASE_WS_URL:-}" ]; then
             export RYO_WS_RPC="$BASE_WS_URL"
@@ -187,35 +189,32 @@ jobs:
             export RYO_HTTP_RPC="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}"
             echo "endpoint: Alchemy (derived from key)"
           fi
-          # newHeads costs ~1.4 M CU/hour on Alchemy (kept off), and is free
-          # plus useful on a custom endpoint — WATCH_HEADS=1 enables it.
-          if [ "${WATCH_HEADS:-}" = "1" ]; then
-            export RYO_NO_HEADS=0
-            echo "heads: ON (socket pin + gap detection)"
+          # Heads: ON for trading modes (socket pin, head-gap rescue);
+          # OFF for dry-run by default (the ~1.4 M CU/h metronome, §0ai).
+          if [ "$MODE" = "dry-run" ]; then
+            if [ "${WATCH_HEADS:-}" = "1" ]; then RYO_NO_HEADS=0; else RYO_NO_HEADS=1; fi
+          else
+            if [ "${WATCH_HEADS:-}" = "0" ]; then RYO_NO_HEADS=1; else RYO_NO_HEADS=0; fi
           fi
-          echo "segment length: ${WATCH_SECONDS}s (ends with SIGTERM -> graceful drain + runs stop row)"
+          export RYO_NO_HEADS
+          echo "mode: ${MODE} | heads: $([ "$RYO_NO_HEADS" = "1" ] && echo OFF || echo ON) | log-mode: ${RYO_LOG_MODE} | core: ${RYO_MANIFEST}"
           timeout -s TERM --kill-after 90 "${WATCH_SECONDS}" \
             ./target/release/ryo-watch \
               --ws-rpc "$RYO_WS_RPC" --http-rpc "$RYO_HTTP_RPC" \
-              --local-sim --manifest deployments/8453.observer.json \
+              --manifest "$RYO_MANIFEST" \
+              --mode "$MODE" \
               --source logs \
               watch --show-empty --metrics-every "${RYO_METRICS_EVERY}" \
             2>&1 | tee "$RUNNER_TEMP/watch.log"
           ec=${PIPESTATUS[0]}
-          # 124 = timeout fired (a segment that ran its full length: success).
           if [ "$ec" -eq 124 ]; then ec=0; fi
           echo "WATCH_EXIT=$ec" >> "$GITHUB_ENV"
           exit "$ec"
 
       - name: Relay — start the next segment now (opt-in chain)
         # Runs BEFORE the log upload so the successor runner boots while this
-        # one is still tidying: the watcher was already SIGTERM'd and drained
-        # in the previous step; the database never sees a longer gap than the
-        # runner handover. segments=0 stops the chain; each relay passes N-1.
-        # Mechanism: POST workflow_dispatch on THIS workflow file — the one
-        # chaining endpoint the job's GITHUB_TOKEN (actions:write) is allowed
-        # to call. (repository_dispatch rejects integration tokens outright
-        # with 403 "Resource not accessible by integration" — measured live.)
+        # one tidies. The chain preserves the chosen MODE — a live program
+        # never silently degrades to dry-run (or the reverse).
         if: always() && env.SEGMENTS != '0'
         run: |
           set -euo pipefail
@@ -225,11 +224,9 @@ jobs:
           fi
           NEXT=$(( SEGMENTS - 1 ))
           if [ "$NEXT" -lt 0 ]; then NEXT=0; fi
-          echo "relay: dispatching the next segment on ${REF} (remaining after it: ${NEXT})"
-          # WATCH_SECONDS/NEXT are numeric-validated in preflight; only they
-          # reach the JSON payload.
-          printf '{"ref":"%s","inputs":{"watch_seconds":"%s","segments":"%s"}}' \
-            "$REF" "$WATCH_SECONDS" "$NEXT" \
+          echo "relay: dispatching next ${MODE} segment (remaining after it: ${NEXT})"
+          printf '{"ref":"%s","inputs":{"mode":"%s","log_mode":"%s","watch_seconds":"%s","segments":"%s"}}' \
+            "$REF" "$MODE" "$LOG_MODE_IN" "$WATCH_SECONDS" "$NEXT" \
             | gh api "repos/${RELAY_REPO}/actions/workflows/watcher-dryrun.yml/dispatches" --input -
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -247,11 +244,13 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Watcher dry-run segment #${{ github.run_number }}"
+            echo "## Watcher segment #${{ github.run_number }} — mode \`${MODE}\`"
             echo ""
-            echo "- exit handling: \`timeout -s TERM\` -> graceful drain, \`runs\` stop row written"
+            echo "- core: deployed RyoCore via \`deployments/8453.json\` (no local-sim path)"
+            echo "- exit handling: \`timeout -s TERM\` -> graceful drain (\`runs\` stop row on Log-Mode runs)"
             grep -o 'events=[0-9]* scans=[0-9]* skipped=[0-9]* failed=[0-9]*' "$RUNNER_TEMP/watch.log" | tail -1 | sed 's/^/- counters: `/' | sed 's/$/`/' || true
-            grep -o 'reason="[a-zA-Z ]*"' "$RUNNER_TEMP/watch.log" | tail -1 | sed 's/^/- stop: /' || true
-            echo "- relay: segments remaining was \`${SEGMENTS}\`; next chain starts only on a clean exit"
-            echo "- decisions live in the Supabase project; audit replays them offline"
+            grep -aoE 'opportunities=[0-9]+' "$RUNNER_TEMP/watch.log" | tail -1 | sed 's/^/- found: /' || true
+            grep -ao 'reason="[^"]*"' "$RUNNER_TEMP/watch.log" | tail -1 | sed 's/^/- stop: /' || true
+            echo "- relay: segments remaining was \`${SEGMENTS}\`; chain keeps mode \`${MODE}\`"
+            echo "- verdicts (won/lost/real dollars) are NOT written by the bot: the audit replays the DB offline"
           } >> "$GITHUB_STEP_SUMMARY"
